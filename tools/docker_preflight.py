@@ -20,5 +20,6 @@ if __name__ == '__main__':
         if 'No such image' not in image.stderr:
             sys.exit('Cannot inspect the build image: ' + image.stderr.strip())
         repo = Path(__file__).resolve().parents[1]
+        dockerfile = sys.argv[2] if len(sys.argv) > 2 else 'tools/local-cross.Dockerfile'
         subprocess.run(['docker', 'build', '--platform', 'linux/amd64', '-t', sys.argv[1],
-                        '-f', str(repo / 'tools/local-cross.Dockerfile'), str(repo)], check=True)
+                        '-f', str(repo / dockerfile), str(repo)], check=True)
