@@ -1,19 +1,31 @@
 #!/usr/bin/env bash
-# Cross-builds the guest OpenXR pieces (Khronos loader, hello_xr, QuestBridge runtime) for the
-# glibc arm64 Arch guest into app/build/questbridge/linuxfs.
+# Builds the guest OpenXR pieces (Khronos loader, hello_xr, QuestBridge runtime) for the glibc
+# arm64 Arch guest into app/build/questbridge/linuxfs: natively on arm64 hosts, cross on x86_64.
 set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-image_name=${DROIDDECK_GUEST_IMAGE:-droiddeck-guest-cross:24.04-v1}
+# Under qemu (colima on Apple silicon without Rosetta) the amd64 cross g++ segfaults at random,
+# so arm64 hosts build natively unless DROIDDECK_GUEST_CROSS=1.
+if [[ "$(uname -m)" =~ ^(arm64|aarch64)$ && "${DROIDDECK_GUEST_CROSS:-0}" != 1 ]]; then
+    image_name=${DROIDDECK_GUEST_IMAGE:-droiddeck-guest-native:24.04-v1}
+    dockerfile=tools/questbridge/guest-native.Dockerfile
+    platform=linux/arm64
+    cross=
+else
+    image_name=${DROIDDECK_GUEST_IMAGE:-droiddeck-guest-cross:24.04-v1}
+    dockerfile=tools/questbridge/guest-cross.Dockerfile
+    platform=linux/amd64
+    cross=aarch64-linux-gnu-
+fi
 for tool in docker curl tar shasum python3; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
-        echo "${tool} is required to cross-build the guest OpenXR libraries." >&2
+        echo "${tool} is required to build the guest OpenXR libraries." >&2
         exit 1
     fi
 done
 
 # A wedged daemon used to hang indefinitely and then trigger an unnecessary image rebuild.
-python3 "${repo_root}/tools/docker_preflight.py" "${image_name}" tools/questbridge/guest-cross.Dockerfile
+python3 "${repo_root}/tools/docker_preflight.py" "${image_name}" "${dockerfile}" "${platform}"
 
 # Pinned downloads are kept between builds, named by their checksum, so a rebuild fetches nothing
 # it already has. A cached file is checked again before use; a bad one is fetched anew.
@@ -46,25 +58,28 @@ rm -rf -- "${repo_root:?}/${work}" "${repo_root:?}/${out}"
 mkdir -p "${repo_root}/${work}" "${repo_root}/${out}"
 tar -xzf "${sdk_archive}" -C "${repo_root}/${work}"
 
-docker run --rm -i --platform linux/amd64 --user "$(id -u):$(id -g)" -v "${repo_root}:/src" -w /src \
+docker run --rm -i --platform "${platform}" --user "$(id -u):$(id -g)" -v "${repo_root}:/src" -w /src \
     -e WORK="/src/${work}" -e OUT="/src/${out}" -e SDK="/src/${work}/OpenXR-SDK-Source-${OPENXR_SDK_TAG}" \
-    "${image_name}" bash -s <<'GUEST'
+    -e CROSS="${cross}" "${image_name}" bash -s <<'GUEST'
 set -euo pipefail
 build=${WORK}/build
 stage=${WORK}/stage
-cat > "${WORK}/aarch64-linux-gnu.cmake" <<'EOF'
+toolchain=()
+if [[ -n "${CROSS}" ]]; then
+    cat > "${WORK}/aarch64-linux-gnu.cmake" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
-set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
-set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+set(CMAKE_C_COMPILER ${CROSS}gcc)
+set(CMAKE_CXX_COMPILER ${CROSS}g++)
 set(CMAKE_LIBRARY_ARCHITECTURE aarch64-linux-gnu)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 EOF
+    toolchain=(-DCMAKE_TOOLCHAIN_FILE="${WORK}/aarch64-linux-gnu.cmake")
+fi
 # Linux always runs the SDK's presentation.cmake, which demands one window backend; xlib is the
 # cheapest (headers plus Xxf86vm/Xrandr at configure time) and hello_xr's Vulkan path links no X
 # library. GL/GLES/EGL lookups are disabled so the build stays Vulkan-only whatever the image has.
-cmake -S "${SDK}" -B "${build}" -G Ninja \
-    -DCMAKE_TOOLCHAIN_FILE="${WORK}/aarch64-linux-gnu.cmake" \
+cmake -S "${SDK}" -B "${build}" -G Ninja "${toolchain[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${stage}" \
     -DCMAKE_INSTALL_LIBDIR=lib \
@@ -98,7 +113,7 @@ runtime=tools/questbridge/runtime
 shopt -s nullglob
 sources=("${runtime}"/*.c)
 if (( ${#sources[@]} )); then
-    aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -pthread -std=gnu11 \
+    "${CROSS}gcc" -shared -fPIC -O2 -Wall -pthread -std=gnu11 \
         -I "${runtime}" -I tools/questbridge/protocol -I "${stage}/include" \
         -o "${lib}/libopenxr_questbridge.so" "${sources[@]}" -ldl -lpthread
     elves+=("${lib}/libopenxr_questbridge.so")
@@ -107,14 +122,14 @@ if [[ -f "${runtime}/questbridge.json" ]]; then
     cp "${runtime}/questbridge.json" "${lib}/questbridge.json"
 fi
 
-aarch64-linux-gnu-strip --strip-unneeded "${elves[@]}"
+"${CROSS}strip" --strip-unneeded "${elves[@]}"
 for elf in "${elves[@]}"; do
-    if ! aarch64-linux-gnu-readelf -h "${elf}" | grep -q 'Machine:.*AArch64'; then
+    if ! "${CROSS}readelf" -h "${elf}" | grep -q 'Machine:.*AArch64'; then
         echo "${elf} is not an AArch64 ELF" >&2
         exit 1
     fi
 done
-if ! aarch64-linux-gnu-readelf -d "${lib}/hello_xr" | grep -q 'NEEDED.*\[libopenxr_loader\.so\.1\]'; then
+if ! "${CROSS}readelf" -d "${lib}/hello_xr" | grep -q 'NEEDED.*\[libopenxr_loader\.so\.1\]'; then
     echo "hello_xr does not link libopenxr_loader.so.1" >&2
     exit 1
 fi
