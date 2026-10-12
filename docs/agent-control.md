@@ -78,6 +78,7 @@ artifact or file error, 7 debugging tools disabled.
 tools/droiddeckctl state                         # schema 2, below
 tools/droiddeckctl start steam --wait            # --ui desktop, --url steam://..., --timeout
 tools/droiddeckctl start steam --wait --reuse    # keep a Steam session that is already up
+tools/droiddeckctl start vr --wait               # Quest: Steam on the headset's panel, XR bridge for its games
 tools/droiddeckctl start desktop
 tools/droiddeckctl run /usr/bin/foo -- arg1 arg2
 tools/droiddeckctl wait ready|idle|failed        # --timeout (default 90 s)
@@ -126,6 +127,9 @@ A sleeping device suspends the session and hides the app's windows from `ui dump
 virtual pad, the same one the on-screen controls drive, so games that ignore touch still respond.
 `launch`, `quit` and `cdp` need a Steam session; `focus` and `wait focused` need gamescope (every
 mode except the desktop).
+A VR session (`start vr`, Quest only) reports `mode` `steam` with an `id` ending in `-vr`. It has no
+session screen, so `input pad`, `stick` and `trigger` answer `NO_PAD`; keys, text, taps and swipes
+reach the Steam panel.
 
 ## State (schema 2)
 

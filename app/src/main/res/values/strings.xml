@@ -1301,6 +1301,8 @@
 
     <!-- Session (SessionActivity) -->
     <string name="session_wait_removal">Wait for runtime removal to finish</string>
+    <!-- VR session (xr.VrSessionActivity): the headset's OpenXR runtime or its panel layer could not be used -->
+    <string name="xr_bridge_unavailable">VR is not available: the headset\'s OpenXR runtime could not be used</string>
     <!-- Drawer title when the running program has no known name -->
     <string name="session_title_game">Game</string>
     <!-- Shown as "Auto (touchpad)" in the drawer's touch setting -->

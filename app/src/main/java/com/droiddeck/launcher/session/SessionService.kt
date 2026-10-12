@@ -89,6 +89,8 @@ class SessionService : Service() {
     private var activityVisible = true
     private var screenOn = true
     private var manualPauseRequested = false
+    /** This session is MODE_VR; SessionState.mode says steam, which is what it is to everything else. */
+    private var vr = false
     /** An explicit Steam sleep request is independent of the background policy. */
     private var steamSleepToken: String? = null
     private var nativeSleepToken: String? = null
@@ -213,6 +215,8 @@ class SessionService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        // Before the notification: its taps open the activity the session is shown in.
+        if (!SessionState.running) vr = intent?.getStringExtra(EXTRA_MODE) == MODE_VR
         startForeground(NOTIFICATION_ID, buildNotification())
         if (SessionState.running) return START_NOT_STICKY
         if (SessionState.stopRequested) {
@@ -220,7 +224,7 @@ class SessionService : Service() {
             stopSession(0)
             return START_NOT_STICKY
         }
-        SessionState.mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_STEAM
+        SessionState.mode = if (vr) MODE_STEAM else intent?.getStringExtra(EXTRA_MODE) ?: MODE_STEAM
         suspendPolicy = SessionPrefs.suspendPolicy(this, SessionState.mode)
         steamDownloadsInBackground = SessionPrefs.steamDownloadsInBackground(this)
         activityVisible = true
@@ -411,7 +415,7 @@ class SessionService : Service() {
             add("cd \"\$HOME\" && exec /bin/bash -i")
         }
         guest.add(LinuxRuntime.SESSION_SCRIPT)
-        guest.add(SessionState.mode)
+        guest.add(if (vr) MODE_VR else SessionState.mode)
         if (SessionState.mode == MODE_STEAM) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
             guest.add(it)
             Log.i(TAG, "steam: handing the client $it")
@@ -1695,9 +1699,10 @@ class SessionService : Service() {
         }
         manager?.createNotificationChannel(channel)
 
+        val activity = if (vr) com.droiddeck.launcher.xr.VrSessionActivity::class.java else SessionActivity::class.java
         val open = PendingIntent.getActivity(
             this, 0,
-            Intent(this, SessionActivity::class.java)
+            Intent(this, activity)
                 .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
             PendingIntent.FLAG_IMMUTABLE,
         )
@@ -1707,7 +1712,7 @@ class SessionService : Service() {
         )
         val resume = PendingIntent.getActivity(
             this, 2,
-            Intent(this, SessionActivity::class.java)
+            Intent(this, activity)
                 .setAction(ACTION_RESUME)
                 .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
             PendingIntent.FLAG_IMMUTABLE,
@@ -1854,6 +1859,9 @@ class SessionService : Service() {
 
         const val EXTRA_MODE = "mode"
         const val MODE_STEAM = "steam"
+        /** The Steam session in the headset (xr.VrSessionActivity): MODE_STEAM but for the guest's
+         *  command line (droiddeck-session vr) and the activity the notification opens. */
+        const val MODE_VR = "vr"
         const val MODE_DESKTOP = "lxqt"
         /** A program inside the runtime, fullscreen under gamescope (EXTRA_PROGRAM = its path). */
         const val MODE_RUN = "run"

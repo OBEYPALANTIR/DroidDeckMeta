@@ -4,6 +4,7 @@
 #   droiddeck-session desktop            the file manager
 #   droiddeck-session run <path>         a Linux program (AppImage, script or ELF)
 #   droiddeck-session steam [steam-url]  the native Steam client
+#   droiddeck-session vr [steam-url]     the same, with the Quest's OpenXR bridge for its games
 #   droiddeck-session lxqt               the KDE Plasma desktop (DroidDeck's desktop package)
 # BL_WIDTH / BL_HEIGHT size the output, BL_FPS limits it, BL_LOG collects everything said here.
 set -u
@@ -28,6 +29,9 @@ if [ -n "${BL_LOG:-}" ] && [ -z "${BL_INSIDE:-}" ]; then
   echo "== gamescope: $(gamescope --version 2>&1 | head -1) at $(command -v gamescope)"
   echo "== rootfs: $(cat /.version 2>/dev/null || echo unversioned)"
 fi
+# vr is the steam session with the XR bridge as the runtime of everything the client starts
+# (PLAN.md Loop 2 item 8): steam from here on, and BL_VR carries it through gamescope's exec.
+if [ "$mode" = vr ]; then mode=steam; export BL_VR=1; fi
 
 # Every program loads the locale LANG names (C.UTF-8) before main(). glibc ships it as a directory,
 # which it looks for once per category under two spellings before reading gconv's module lists:
@@ -210,6 +214,25 @@ program_cores() {
     [ "$max" -gt "$min" ] && list="$list${list:+,}$n"
   done
   echo "$list"
+}
+
+# vr mode, for the client and all it starts: the Khronos loader finds the bridge runtime through
+# XR_RUNTIME_JSON and native titles find the loader on LD_LIBRARY_PATH; the runtime reaches the
+# app's service on the abstract socket named for the app's package as the bwrap one is
+# (BwrapSpawner); OpenVR titles find xrizer through the path registry.
+vr_environment() {
+  local xr=/usr/local/lib/droiddeck-xr bwrap=${DROIDDECK_BWRAP_SOCKET:-com.droiddeck.launcher.bwrap}
+  local vrpath=${XDG_CONFIG_HOME:-$HOME/.config}/openvr/openvrpaths.vrpath
+  export XR_RUNTIME_JSON=$xr/questbridge.json
+  export DROIDDECK_XR_SOCKET=@${bwrap%.bwrap}.xr-bridge
+  export LD_LIBRARY_PATH=$xr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  echo "== vr: OpenXR runtime $XR_RUNTIME_JSON, service $DROIDDECK_XR_SOCKET"
+  [ -f "$XR_RUNTIME_JSON" ] || echo "== vr: this runtime has no $XR_RUNTIME_JSON; OpenXR titles will find no runtime"
+  if [ -d /usr/local/lib/xrizer ]; then
+    mkdir -p "${vrpath%/*}"
+    printf '%s\n' '{"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"}' > "$vrpath"
+    echo "== vr: OpenVR titles go through xrizer ($vrpath)"
+  fi
 }
 
 if [ -z "${BL_INSIDE:-}" ]; then
@@ -821,6 +844,9 @@ BUSCONF
     fi
 
     export STEAM_RUNTIME=1
+    # Before the client's own libraries go first: Proton's launcher drops only those
+    # (steam-compatibility's bl_libpath), so the bridge's loader stays on its games' path too.
+    [ "${BL_VR:-}" = 1 ] && vr_environment
     export LD_LIBRARY_PATH=$steam_root/steamrtarm64:$steam_root/steamrtarm64/panorama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     export SDL_VIDEO_X11_DGAMOUSE=0
     # Decky is optional and session scoped: the app's marker opts in, and this supervisor is

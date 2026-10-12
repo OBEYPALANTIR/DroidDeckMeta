@@ -131,6 +131,11 @@ docker run --rm --platform linux/amd64 \
         chown -R '"$(id -u):$(id -g)"' app/src/main/assets/linuxfs
     '
 
+# The guest's OpenXR pieces (tools/questbridge): the Khronos loader, hello_xr and the bridge runtime
+# that talks to the app's xr-bridge-service. Cross-built in their own image, then laid over linuxfs.
+bash "${repo_root}/tools/questbridge/build-guest.sh"
+cp -a "${repo_root}/app/build/questbridge/linuxfs/." "${linuxfs_dir}/"
+
 github_repo=${DROIDDECK_GITHUB_REPOSITORY:-}
 if [[ -z "${github_repo}" ]]; then
     origin_url=$(git -C "${repo_root}" remote get-url origin)
