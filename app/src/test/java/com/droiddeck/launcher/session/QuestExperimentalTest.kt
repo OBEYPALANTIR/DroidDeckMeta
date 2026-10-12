@@ -36,7 +36,10 @@ class QuestExperimentalTest {
 
     @Test fun questDefaultsSelectBothCompatibilityPathsAndAreAppliedOnlyOnce() {
         ShadowBuild.setModel("Quest 3")
-        QuestExperimental.initialize(context)
+        val standard = object : ContextWrapper(context) {
+            override fun getPackageName() = "com.droiddeck.launcher"
+        }
+        QuestExperimental.initialize(standard)
         assertEquals(SessionPrefs.GPU_DRIVERS_MANUAL, SessionPrefs.gpuDriverMode(context))
         assertEquals(QuestExperimental.DRIVER, SessionPrefs.androidDriver(context))
         assertEquals("", SessionPrefs.linuxDriver(context))
@@ -57,10 +60,14 @@ class QuestExperimentalTest {
     }
 
     @Test fun installedPackagesUseSeparateSandboxSockets() {
-        val quest = object : ContextWrapper(context) {
-            override fun getPackageName() = "com.droiddeck.quest"
+        val packages = listOf("com.droiddeck.launcher", "com.tencent.ig",
+            "com.antutu.benchmark.full", "com.ludashi.benchmark")
+        val sockets = packages.map { name ->
+            val variant = object : ContextWrapper(context) {
+                override fun getPackageName() = name
+            }
+            BwrapSpawner.socket(variant).also { assertEquals("$name.bwrap", it) }
         }
-        assertEquals("com.droiddeck.quest.bwrap", BwrapSpawner.socket(quest))
-        assertNotEquals(BwrapSpawner.socket(context), BwrapSpawner.socket(quest))
+        assertEquals(packages.size, sockets.toSet().size)
     }
 }
