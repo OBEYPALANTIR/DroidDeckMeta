@@ -177,6 +177,23 @@ export XDG_DATA_DIRS=$XDG_DATA_HOME/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/
 # program from the rail): the user's game cores when set (BL_GAME_CPUS), else every core but the
 # slowest cluster - Android is free to park an emulator's threads on the little cores, and those
 # are what compile shaders and recompile PPU/SPU code. BL_PIN_CORES=0 leaves the scheduler alone.
+# A prime-only client mask can be reset without a thread-count change (Steam or Android).
+# Read status with shell builtins; only invoke taskset when a single-core mask has drifted.
+client_single_core_matches() {
+  local wanted=$1 task key cpus
+  shift
+  [[ $wanted =~ ^[0-9]+$ ]] || return 0
+  for task in "$@"; do
+    [ -r "$task/status" ] || continue
+    while read -r key cpus; do
+      [ "$key" = Cpus_allowed_list: ] || continue
+      [ "$cpus" = "$wanted" ] || return 1
+      break
+    done < "$task/status" 2>/dev/null
+  done
+  return 0
+}
+
 program_cores() {
   [ "${BL_PIN_CORES:-1}" = 0 ] && return 0
   command -v taskset >/dev/null 2>&1 || return 0
@@ -445,8 +462,8 @@ case $mode in
     # reasonable thing to do while a game is running and the wrong thing when the client is all
     # there is. BL_CLIENT_CPUS overrides it. Re-applied on a beat because steamwebhelper spawns
     # children continuously and each one inherits Steam's choice, not ours. The beat reads /proc
-    # itself instead of running pgrep, and only runs taskset for a process that is new or has
-    # grown threads since it was last pinned: every fork is a round of traced syscalls, and a
+    # itself instead of running pgrep, and runs taskset for new threads or a single-core mask
+    # that has drifted since it was last pinned: every fork is a round of traced syscalls, and a
     # beat that forked a taskset per process every 5 s did that for an hour. taskset -a, because
     # without it only a process's main thread moves and the renderer's workers stay where they were.
     if [ -n "${BL_CLIENT_CPUS:-}" ]; then
@@ -459,7 +476,9 @@ case $mode in
             case $_c in *steamwebhelper*|*steamrtarm64/steam|*gamescope*) ;; *) continue ;; esac
             _t=("$_d"/task/*)
             _p=${_d#/proc/}
-            [ "${_bl_pinned[$_p]:-}" = "${#_t[@]}" ] && continue
+            if [ "${_bl_pinned[$_p]:-}" = "${#_t[@]}" ] && client_single_core_matches "$BL_CLIENT_CPUS" "${_t[@]}"; then
+              continue
+            fi
             taskset -a -cp "$BL_CLIENT_CPUS" "$_p" >/dev/null 2>&1 || true
             _bl_pinned[$_p]=${#_t[@]}
           done
@@ -884,6 +903,12 @@ BUSCONF
       export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
       echo "== steam: Deck mode on (-steamdeck -steamos3)"
     fi
+    # The power menu's Shut Down and Restart. Without these the client blanks its interface and
+    # stays up (device, 2026-10-12: System.ShutdownPC and nothing after it). With them it does what
+    # SteamOS's gamescope session expects: writes the sentinel and exits. The loop below ends the
+    # session for one and starts the client again for the other.
+    export STEAMOS_STEAM_SHUTDOWN_SENTINEL="$HOME/.bl-steam-shutdown"
+    export STEAMOS_STEAM_REBOOT_SENTINEL="$HOME/.bl-steam-reboot"
     # What a killed session leaves behind. Android ends sessions without warning (backgrounding, the
     # low-memory killer), and the client then finds .crash - opening its update UI on the spinner -
     # and the web helper's Singleton* locks in htmlcache, owned by a process that is gone, which can
@@ -941,7 +966,7 @@ BUSCONF
     # An update that cannot install asks for a restart (rc=42) every time; the count is capped so a
     # session can never again loop in silence, which reads as a menu opening and closing by itself.
     steam_updates=0
-    rm -f "$HOME/.bl-stop-requested"
+    rm -f "$HOME/.bl-stop-requested" "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" "$STEAMOS_STEAM_REBOOT_SENTINEL"
     # The client brings a game it launched to the front only while it counts someone as present,
     # which it reads from gamescope's input counter. A game the app launches after a few minutes
     # with no touch starts behind the library page and stays there until the next input (device,
@@ -1045,6 +1070,18 @@ BUSCONF
       if [ -f "$HOME/.bl-stop-requested" ]; then
         rm -f "$HOME/.bl-stop-requested" "$HOME/.bl-restart-once"
         break
+      fi
+      if [ -e "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" ]; then
+        rm -f "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" "$STEAMOS_STEAM_REBOOT_SENTINEL"
+        echo "== steam: Shut Down from the power menu; ending the session"
+        rc=0
+        break
+      fi
+      if [ -e "$STEAMOS_STEAM_REBOOT_SENTINEL" ]; then
+        rm -f "$STEAMOS_STEAM_REBOOT_SENTINEL"
+        echo "== steam: Restart from the power menu; starting the client again"
+        set --
+        continue
       fi
       # The session asked for this exit (the ARM64 Proton landed): start again, without the URL
       # arguments, which were acted on. Not counted against the update cap.
