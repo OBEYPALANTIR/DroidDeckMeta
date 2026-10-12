@@ -329,13 +329,14 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" app/src/main/assets/linuxfs
           ls -l app/src/main/assets/linuxfs/x86_64 app/src/main/assets/linuxfs/i386
 
-      - name: Build the guest OpenXR pieces (loader, hello_xr, libopenxr_questbridge.so)
+      - name: Build the guest OpenXR pieces (loader, hello_xr, libopenxr_questbridge.so, xrizer)
         if: steps.preloads.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           bash tools/questbridge/build-guest.sh
+          bash tools/questbridge/xrizer/build-xrizer.sh
           cp -a app/build/questbridge/linuxfs/. app/src/main/assets/linuxfs/
-          ls -l app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xr
+          ls -l app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xr app/src/main/assets/linuxfs/usr/local/lib/xrizer/bin/linuxarm64
 
       - name: Bundle the droiddeck-esync packs
         env:

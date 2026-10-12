@@ -131,9 +131,12 @@ docker run --rm --platform linux/amd64 \
         chown -R '"$(id -u):$(id -g)"' app/src/main/assets/linuxfs
     '
 
-# The guest's OpenXR pieces (tools/questbridge): the Khronos loader, hello_xr and the bridge runtime
-# that talks to the app's xr-bridge-service. Cross-built in their own image, then laid over linuxfs.
+# The guest's OpenXR pieces (tools/questbridge): the Khronos loader, hello_xr, the bridge runtime
+# that talks to the app's xr-bridge-service, and xrizer (OpenVR on OpenXR) for OpenVR titles. Built
+# in their own image, then laid over linuxfs; build-xrizer.sh must follow build-guest.sh, which
+# recreates the output tree.
 bash "${repo_root}/tools/questbridge/build-guest.sh"
+bash "${repo_root}/tools/questbridge/xrizer/build-xrizer.sh"
 cp -a "${repo_root}/app/build/questbridge/linuxfs/." "${linuxfs_dir}/"
 
 github_repo=${DROIDDECK_GITHUB_REPOSITORY:-}
