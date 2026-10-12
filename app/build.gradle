@@ -178,6 +178,8 @@ android {
     buildFeatures {
         compose true
         buildConfig true
+        // CMake links AAR-shipped native libraries through find_package: the OpenXR loader below.
+        prefab true
     }
 
     testOptions {
@@ -302,6 +304,9 @@ dependencies {
     implementation 'com.flyfishxu:kadb-android:1.2.1'
     // Android terminal view/emulator used by the in-session secondary-display Linux shell.
     implementation 'com.termux.termux-app:terminal-view:0.118.0'
+    // Khronos' OpenXR loader for Android (Apache-2.0): ships libopenxr_loader.so and is the
+    // OpenXR::openxr_loader the XR bridge (cpp/xrbridge) links. Headers vendored at the same tag.
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.63'
 
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.16.1'

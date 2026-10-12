@@ -62,11 +62,16 @@ void qb_vk_unbind(struct qb_vk *vk);
 /* ---- swapchains */
 
 /* Import the images the service allocated for `ci` (fds[i] = image i's dma-buf, owned by this call
- * from now on, closed on destroy or failure). If ci asks for arraySize > 1, sampleCount > 1,
- * mipCount > 1, or a format the imported image cannot be created in, the app gets a guest-owned
- * image of exactly what it asked for and qb_vk_swapchain_release blits (vkCmdBlitImage, which also
- * converts formats) or resolves it into imported image `index`. The imported images are created with
- * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT + VkImageDrmFormatModifierExplicitCreateInfoEXT
+ * from now on, closed on destroy or failure). `ci` is the app's request, unmodified; `info` describes
+ * what the service actually allocated, which differs in two agreed ways: the service image is
+ * (ci->width * ci->arraySize) x ci->height (array layers are flattened side by side; the core sends
+ * layer L as sub_image.x = L * ci->width), and for the BGRA pair the service allocated the RGBA
+ * counterpart (B8G8R8A8_SRGB -> R8G8B8A8_SRGB, UNORM likewise), so the imported VkImage is created in
+ * that RGBA format. If ci asks for arraySize > 1, sampleCount > 1, mipCount > 1, or a format other
+ * than the imported image's, the app gets a guest-owned image of exactly what it asked for and
+ * qb_vk_swapchain_release blits (vkCmdBlitImage, which also converts formats; layer L lands at x
+ * offset L * ci->width) or resolves it into imported image `index`. The imported images are created
+ * with VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT + VkImageDrmFormatModifierExplicitCreateInfoEXT
  * {info->modifier, one plane: offset 0, rowPitch info->stride_bytes}, memory imported with
  * VkImportMemoryFdInfoKHR (DMA_BUF) as a dedicated allocation of info->size_bytes, usage
  * TRANSFER_SRC | TRANSFER_DST | COLOR_ATTACHMENT | SAMPLED. When vkCreateImage refuses the modifier

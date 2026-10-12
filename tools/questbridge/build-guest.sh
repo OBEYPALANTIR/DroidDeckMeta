@@ -99,7 +99,7 @@ shopt -s nullglob
 sources=("${runtime}"/*.c)
 if (( ${#sources[@]} )); then
     aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -pthread -std=gnu11 \
-        -I "${runtime}" -I "${stage}/include" \
+        -I "${runtime}" -I tools/questbridge/protocol -I "${stage}/include" \
         -o "${lib}/libopenxr_questbridge.so" "${sources[@]}" -ldl -lpthread
     elves+=("${lib}/libopenxr_questbridge.so")
 fi

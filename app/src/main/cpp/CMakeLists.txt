@@ -49,6 +49,10 @@ target_link_libraries(sdnative log)
 add_library(deviceinfo SHARED deviceinfo/vkinfo.c)
 target_link_libraries(deviceinfo dl)
 
+# The XR bridge (PLAN.md section 3): the headset's OpenXR runtime driven from this process, and the
+# hidden sample activity that proves it. The Khronos loader comes from its AAR through prefab.
+add_subdirectory(xrbridge)
+
 # Rebuild Termux terminal-emulator's PTY JNI helper with the app's NDK instead of carrying its
 # prebuilt libtermux.so with a redundant libstdc++.so dependency.
 add_library(termux SHARED termux/termux.c)

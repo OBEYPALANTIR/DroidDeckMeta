@@ -1,0 +1,7 @@
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "DroidDeck Quest bridge",
+        "library_path": "./libopenxr_questbridge.so"
+    }
+}

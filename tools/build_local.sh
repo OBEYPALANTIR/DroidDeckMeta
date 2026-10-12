@@ -343,9 +343,10 @@ done
 
 readelf_path=$(find "${NDK}/toolchains/llvm/prebuilt" -name llvm-readelf | head -1)
 [[ -x "${readelf_path}" ]] || { echo "NDK llvm-readelf is missing" >&2; exit 1; }
+# macOS's bash 3.2 treats an empty array as unset under set -u; the +-expansion keeps it quiet.
 stores_check=()
 [[ "${DROIDDECK_SKIP_RUST:-0}" != 1 ]] || stores_check+=(--without-stores)
-python3 tools/release/check_android_libraries.py "${apk}" --readelf "${readelf_path}" "${stores_check[@]}"
+python3 tools/release/check_android_libraries.py "${apk}" --readelf "${readelf_path}" ${stores_check[@]+"${stores_check[@]}"}
 git diff --exit-code -- app/src/main/rust/stores/Cargo.lock
 
 build_tools=$(find "${sdk_dir}/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort -V | tail -1)
