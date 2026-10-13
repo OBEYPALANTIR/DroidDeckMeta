@@ -221,6 +221,8 @@ program_cores() {
 # app's service on the abstract socket named for the app's package as the bwrap one is
 # (BwrapSpawner); OpenVR titles find xrizer through the path registry.
 vr_environment() {
+  # Once per process tree: the agent, the client and this script's inner pass all inherit it.
+  [ "${XR_RUNTIME_JSON:-}" = /usr/local/lib/droiddeck-xr/questbridge.json ] && return 0
   local xr=/usr/local/lib/droiddeck-xr bwrap=${DROIDDECK_BWRAP_SOCKET:-com.droiddeck.launcher.bwrap}
   local vrpath=${XDG_CONFIG_HOME:-$HOME/.config}/openvr/openvrpaths.vrpath
   export XR_RUNTIME_JSON=$xr/questbridge.json
@@ -399,7 +401,9 @@ if [ "${BL_DESKTOP:-}" != 1 ] && [ -n "${BL_ANDROID_CLIPBOARD:-}" ] && [ -x /usr
   /usr/local/bin/droiddeck-clipboard "$BL_ANDROID_CLIPBOARD" &
 fi
 
-# KDE already has a session agent; starting another would race its request files.
+# KDE already has a session agent; starting another would race its request files. In vr mode the
+# agent gets the bridge environment too, so `droiddeckctl guest` runs OpenXR programs as Steam would.
+[ "${BL_VR:-}" = 1 ] && vr_environment
 [ "${BL_DESKTOP:-}" = 1 ] || start_agent
 
 case $mode in
