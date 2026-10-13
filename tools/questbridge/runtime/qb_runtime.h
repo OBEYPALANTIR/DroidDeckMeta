@@ -18,6 +18,7 @@
 
 #include "qb_vulkan.h"
 #include "qb_ipc.h"
+#include "qb_math.h"
 #include <openxr/openxr_loader_negotiation.h>
 
 #pragma GCC visibility push(hidden)
@@ -217,54 +218,6 @@ static inline XrTime qb_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (XrTime)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
-
-/* ---- poses: a * b is b (given in a's frame) in a's parent frame */
-
-static inline XrQuaternionf qb_quat_mul(XrQuaternionf a, XrQuaternionf b) {
-    return (XrQuaternionf){
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-    };
-}
-
-static inline XrVector3f qb_quat_rotate(XrQuaternionf q, XrVector3f v) {
-    XrVector3f t = {2.0f * (q.y * v.z - q.z * v.y), 2.0f * (q.z * v.x - q.x * v.z), 2.0f * (q.x * v.y - q.y * v.x)};
-    return (XrVector3f){
-        v.x + q.w * t.x + (q.y * t.z - q.z * t.y),
-        v.y + q.w * t.y + (q.z * t.x - q.x * t.z),
-        v.z + q.w * t.z + (q.x * t.y - q.y * t.x),
-    };
-}
-
-static inline XrPosef qb_pose_mul(XrPosef a, XrPosef b) {
-    XrVector3f p = qb_quat_rotate(a.orientation, b.position);
-    return (XrPosef){qb_quat_mul(a.orientation, b.orientation),
-                     {a.position.x + p.x, a.position.y + p.y, a.position.z + p.z}};
-}
-
-static inline XrPosef qb_pose_inv(XrPosef a) {
-    XrQuaternionf q = {-a.orientation.x, -a.orientation.y, -a.orientation.z, a.orientation.w};
-    XrVector3f p = qb_quat_rotate(q, a.position);
-    return (XrPosef){q, {-p.x, -p.y, -p.z}};
-}
-
-/* A unit orientation within 1% (NaN fails). */
-static inline int qb_pose_valid(const XrPosef *p) {
-    const XrQuaternionf *q = &p->orientation;
-    float n = q->x * q->x + q->y * q->y + q->z * q->z + q->w * q->w;
-    return n > 0.98f && n < 1.02f;
-}
-
-static inline XrPosef qb_pose_from_wire(const struct qb_posef *p) {
-    return (XrPosef){{p->qx, p->qy, p->qz, p->qw}, {p->x, p->y, p->z}};
-}
-
-static inline struct qb_posef qb_pose_to_wire(XrPosef p) {
-    return (struct qb_posef){p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
-                             p.position.x, p.position.y, p.position.z, 0.0f};
 }
 
 /* ---- qb_runtime.c */

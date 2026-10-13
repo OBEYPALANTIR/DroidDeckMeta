@@ -248,9 +248,8 @@ XrResult qb_xrDestroySpace(XrSpace space) {
 }
 
 /* Lock held: `sp` in `base`, as inverse(base offset) * LOCATE_SPACE * (sp offset); flags 0 while either
- * cannot be located. Velocities go through the same composition: the offsets are rigid transforms, so
- * each wire vector is rotated by the inverse of the base offset's orientation (magnitudes unchanged);
- * vf/linear/angular are untouched when the app chained no velocity (NULL). */
+ * cannot be located. Velocities follow qb_velocity_compose (the offset point's arc is added to the
+ * linear velocity); vf/linear/angular are untouched when the app chained no velocity (NULL). */
 static XrResult locate(const struct qb_space_handle *sp, const struct qb_space_handle *base, XrTime time,
                        XrSpaceLocationFlags *flags, XrPosef *pose, XrSpaceVelocityFlags *vf, XrVector3f *linear,
                        XrVector3f *angular) {
@@ -269,13 +268,10 @@ static XrResult locate(const struct qb_space_handle *sp, const struct qb_space_h
     *pose = qb_pose_mul(qb_pose_mul(qb_pose_inv(base->offset), qb_pose_from_wire(&loc.pose)), sp->offset);
     if (vf) {
         *vf = loc.velocity_flags;
-        if (loc.velocity_flags && linear && angular) {
-            /* inverse(base offset) as a rotation: conjugate of a unit quaternion */
-            XrQuaternionf inv = {-base->offset.orientation.x, -base->offset.orientation.y,
-                                 -base->offset.orientation.z, base->offset.orientation.w};
-            *linear = qb_quat_rotate(inv, (XrVector3f){loc.linear[0], loc.linear[1], loc.linear[2]});
-            *angular = qb_quat_rotate(inv, (XrVector3f){loc.angular[0], loc.angular[1], loc.angular[2]});
-        }
+        if (loc.velocity_flags && linear && angular)
+            qb_velocity_compose(base->offset, sp->offset, (XrQuaternionf){loc.pose.qx, loc.pose.qy, loc.pose.qz, loc.pose.qw},
+                                loc.velocity_flags, (XrVector3f){loc.linear[0], loc.linear[1], loc.linear[2]},
+                                (XrVector3f){loc.angular[0], loc.angular[1], loc.angular[2]}, vf, linear, angular);
     }
     return XR_SUCCESS;
 }
