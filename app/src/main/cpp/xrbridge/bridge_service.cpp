@@ -1331,10 +1331,19 @@ void BridgeService::onLocateSpace(const qb_locate_space &locate, Reply &reply) {
     const XrSpace base = spaceOf(locate.base_space);
     if (space == XR_NULL_HANDLE || base == XR_NULL_HANDLE) return reply.fail(XR_ERROR_VALIDATION_FAILURE);
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-    if (!xr_.locateSpace(space, base, locate.time, location)) return reply.fail(xr_.lastResult());
+    XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+    if (!xr_.locateSpace(space, base, locate.time, location, &velocity)) return reply.fail(xr_.lastResult());
     qb_space_location &out = reply.as<qb_space_location>();
     out.location_flags = location.locationFlags;
     out.pose = toWire(location.pose);
+    out.velocity_flags = velocity.velocityFlags;
+    // No velocity: the vectors stay a defined zero rather than whatever the runtime left behind.
+    out.linear[0] = velocity.velocityFlags ? velocity.linearVelocity.x : 0.0f;
+    out.linear[1] = velocity.velocityFlags ? velocity.linearVelocity.y : 0.0f;
+    out.linear[2] = velocity.velocityFlags ? velocity.linearVelocity.z : 0.0f;
+    out.angular[0] = velocity.velocityFlags ? velocity.angularVelocity.x : 0.0f;
+    out.angular[1] = velocity.velocityFlags ? velocity.angularVelocity.y : 0.0f;
+    out.angular[2] = velocity.velocityFlags ? velocity.angularVelocity.z : 0.0f;
 }
 
 void BridgeService::onSyncActions(Reply &reply) {

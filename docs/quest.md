@@ -58,3 +58,14 @@ fork's XR bridge: `droiddeckctl start vr` opens an immersive session with
 the Steam panel as a quad layer, and guest OpenXR titles render through it
 (hello_xr at 72 fps, 0 dropped). See `docs/vr.md` for architecture,
 commands, build, status and limits.
+
+## Proton games on Quest 3
+
+Untested on DroidDeck's DXVK/Turnip builds (PLAN.md section 12.A.5):
+
+```sh
+tools/droiddeckctl env set DXVK_DISABLE_TIMELINE_SEMAPHORES=1
+tools/droiddeckctl env set TU_DEBUG=noconform
+tools/droiddeckctl env set MESA_VK_WSI_PRESENT_MODE=mailbox
+```
+

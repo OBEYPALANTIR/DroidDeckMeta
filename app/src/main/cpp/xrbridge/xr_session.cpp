@@ -4,8 +4,10 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <openxr/openxr_reflection.h>
+#include <pthread.h>  // pthread_gettid_np: gettid() itself needs API 29, the app targets 26
 
 #include <algorithm>
+#include <atomic>  // one-line extension-refusal logs
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -28,6 +30,11 @@ XRB_TO_STRING(XrResult)
 XRB_TO_STRING(XrSessionState)
 XRB_TO_STRING(XrReferenceSpaceType)
 XRB_TO_STRING(XrEnvironmentBlendMode)
+XRB_TO_STRING(XrAndroidThreadTypeKHR)
+XRB_TO_STRING(XrPerfSettingsDomainEXT)
+XRB_TO_STRING(XrPerfSettingsSubDomainEXT)
+XRB_TO_STRING(XrPerfSettingsLevelEXT)
+XRB_TO_STRING(XrPerfSettingsNotificationLevelEXT)
 #undef XRB_TO_STRING
 #undef XRB_CASE
 
@@ -118,6 +125,8 @@ bool Session::createInstance(JavaVM *vm, jobject activity) {
             {XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, &runtimeExtensions_.displayRefreshRate},
             {XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME, &runtimeExtensions_.compositionLayerImageLayout},
             {XR_EXT_HAND_TRACKING_EXTENSION_NAME, &runtimeExtensions_.handTracking},
+            {XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME, &runtimeExtensions_.androidThreadSettings},
+            {XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME, &runtimeExtensions_.performanceSettings},
     };
     for (const XrExtensionProperties &extension : offered) {
         LOGI("runtime extension %s v%u", extension.extensionName, extension.extensionVersion);
@@ -132,6 +141,8 @@ bool Session::createInstance(JavaVM *vm, jobject activity) {
     std::vector<const char *> enabled = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME};
     if (runtimeExtensions_.displayRefreshRate) enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if (runtimeExtensions_.androidSurfaceSwapchain) enabled.push_back(XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME);
+    if (runtimeExtensions_.androidThreadSettings) enabled.push_back(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
+    if (runtimeExtensions_.performanceSettings) enabled.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 
     XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
     androidInfo.applicationVM = vm;
@@ -147,6 +158,8 @@ bool Session::createInstance(JavaVM *vm, jobject activity) {
     if (!check(xrCreateInstance(&info, &instance_), "xrCreateInstance")) return false;
     // Optional: without it there is no Steam panel, and everything else still works.
     if (runtimeExtensions_.androidSurfaceSwapchain) load("xrCreateSwapchainAndroidSurfaceKHR", createSurfaceSwapchain_);
+    if (runtimeExtensions_.androidThreadSettings) load("xrSetAndroidApplicationThreadKHR", setApplicationThread_);
+    if (runtimeExtensions_.performanceSettings) load("xrPerfSettingsSetPerformanceLevelEXT", setPerformanceLevel_);
 
     if (!check(xrGetInstanceProperties(instance_, &instanceProperties_), "xrGetInstanceProperties")) return false;
     const XrVersion version = instanceProperties_.runtimeVersion;
@@ -409,6 +422,7 @@ bool Session::createSession() {
         };
         LOGI("display refresh rates: %s Hz, now %.1f", join(refreshRates_, hz).c_str(), refreshRate());
     }
+    applyThreadHints();  // best-effort: without the extension it logs once and the session still works
     return true;
 }
 
@@ -527,6 +541,7 @@ void Session::shutdown() {
     state_ = XR_SESSION_STATE_UNKNOWN;
     running_ = false;
     exiting_ = false;
+    perfLevelsApplied_ = false;
     instanceProperties_ = {XR_TYPE_INSTANCE_PROPERTIES};
     systemProperties_ = {XR_TYPE_SYSTEM_PROPERTIES};
     runtimeExtensions_ = {};
@@ -537,6 +552,8 @@ void Session::shutdown() {
     getDisplayRefreshRate_ = nullptr;
     requestDisplayRefreshRate_ = nullptr;
     createSurfaceSwapchain_ = nullptr;
+    setApplicationThread_ = nullptr;
+    setPerformanceLevel_ = nullptr;
     vm_ = nullptr;
 }
 
@@ -557,8 +574,13 @@ bool Session::pollEvents(const std::function<void(const XrEventDataBuffer &)> &o
                     begin.primaryViewConfigurationType = kViewType;
                     if (!check(xrBeginSession(session_, &begin), "xrBeginSession")) return false;
                     running_ = true;
+                    // Once per session: SUSTAINED_HIGH is WinlatorXR's Quest 3 choice; BOOST is for short bursts.
+                    if (!perfLevelsApplied_)
+                        perfLevelsApplied_ = setPerformanceLevels(XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT,
+                                                                  XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
                 } else if (state_ == XR_SESSION_STATE_STOPPING) {
                     running_ = false;
+                    perfLevelsApplied_ = false;  // the next READY re-applies the levels
                     if (!check(xrEndSession(session_), "xrEndSession")) return false;
                 } else if (state_ == XR_SESSION_STATE_EXITING || state_ == XR_SESSION_STATE_LOSS_PENDING) {
                     exiting_ = true;
@@ -581,6 +603,12 @@ bool Session::pollEvents(const std::function<void(const XrEventDataBuffer &)> &o
             case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB: {
                 const auto &rate = *reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB *>(&event);
                 LOGI("display refresh rate %.1f -> %.1f Hz", rate.fromDisplayRefreshRate, rate.toDisplayRefreshRate);
+                break;
+            }
+            case XR_TYPE_EVENT_DATA_PERF_SETTINGS_EXT: {
+                const auto &perf = *reinterpret_cast<const XrEventDataPerfSettingsEXT *>(&event);
+                LOGI("performance %s %s %s -> %s", toString(perf.domain), toString(perf.subDomain), toString(perf.fromLevel),
+                     toString(perf.toLevel));
                 break;
             }
             case XR_TYPE_EVENT_DATA_EVENTS_LOST:
@@ -685,6 +713,18 @@ bool Session::locateSpace(XrSpace space, XrSpace base, XrTime time, XrSpaceLocat
     return check(xrLocateSpace(space, base, time, &out), "xrLocateSpace");
 }
 
+bool Session::locateSpace(XrSpace space, XrSpace base, XrTime time, XrSpaceLocation &out, XrSpaceVelocity *velocity) {
+    if (!velocity) return locateSpace(space, base, time, out);
+    velocity->type = XR_TYPE_SPACE_VELOCITY;
+    velocity->next = nullptr;
+    velocity->velocityFlags = 0;
+    void *saved = const_cast<void *>(out.next);
+    out.next = velocity;
+    const bool ok = check(xrLocateSpace(space, base, time, &out), "xrLocateSpace");
+    out.next = saved;
+    return ok;
+}
+
 bool Session::applyHaptic(int hand, XrDuration duration, float frequency, float amplitude) {
     XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
     vibration.duration = duration;
@@ -786,6 +826,38 @@ bool Session::requestRefreshRate(float rate) {
         return false;
     }
     return check(requestDisplayRefreshRate_(session_, rate), "xrRequestDisplayRefreshRateFB");
+}
+
+bool Session::applyThreadHints() {
+    // The frame thread drives the session, so it is the renderer main thread.
+    return markApplicationThread(XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR);
+}
+
+bool Session::markApplicationThread(XrAndroidThreadTypeKHR type) {
+    if (!setApplicationThread_) {
+        // One line per process: without the extension every marked thread would log this.
+        static std::atomic<bool> refused{false};
+        if (!refused.exchange(true)) LOGE("xrSetAndroidApplicationThreadKHR: the runtime has no XR_KHR_android_thread_settings");
+        last_ = XR_ERROR_FUNCTION_UNSUPPORTED;
+        return false;
+    }
+    return check(setApplicationThread_(session_, type, static_cast<uint32_t>(pthread_gettid_np(pthread_self()))), "xrSetAndroidApplicationThreadKHR");
+}
+
+bool Session::setPerformanceLevels(XrPerfSettingsLevelEXT cpu, XrPerfSettingsLevelEXT gpu) {
+    if (!setPerformanceLevel_) {
+        // Same one-line refusal as above, for the CPU/GPU pair.
+        static std::atomic<bool> refused{false};
+        if (!refused.exchange(true)) LOGE("xrPerfSettingsSetPerformanceLevelEXT: the runtime has no XR_EXT_performance_settings");
+        last_ = XR_ERROR_FUNCTION_UNSUPPORTED;
+        return false;
+    }
+    // CPU then GPU, one log line for the pair the way the runtime reports them.
+    const bool ok =
+            check(setPerformanceLevel_(session_, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, cpu), "xrPerfSettingsSetPerformanceLevelEXT(CPU)") &&
+            check(setPerformanceLevel_(session_, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, gpu), "xrPerfSettingsSetPerformanceLevelEXT(GPU)");
+    LOGI("performance levels CPU %s GPU %s: %s", toString(cpu), toString(gpu), ok ? "applied" : "failed");
+    return ok;
 }
 
 XrSwapchain Session::createSurfaceSwapchain(uint32_t width, uint32_t height, jobject &surfaceOut) {

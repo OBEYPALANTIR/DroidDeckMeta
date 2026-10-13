@@ -150,8 +150,44 @@ From the dossier (`features.md`), Quest 3 vros 209, app 0.4.0:
 
 Measured numbers: 72 guest fps, 144 copies/s, 0 dropped over 20 s; one
 compositor frame of pipelining latency by design.
+The KGSL policy denial is confirmed on device: `GPUMEM_ALLOC_ID`/`FREE_ID`
+return EACCES and the compat path fires (PLAN.md section 12.A.1).
+
+## Windows VR titles (Proton)
+
+Now that xrizer ships as an aarch64 `vrclient.so`, two candidate paths exist,
+both untested: needs a signed-in Steam with a VR title.
+
+(a) OpenVR titles: `openvr_api.dll` -> Proton's `vrclient` thunk ->
+`/usr/local/lib/xrizer/bin/linuxarm64/vrclient.so` (set by
+`openvrpaths.vrpath`, which the `vr` session writes) -> bridge.
+(b) OpenXR titles: `openxr_loader.dll` -> `wineopenxr` -> `XR_RUNTIME_JSON`
+-> bridge.
+
+Valve's Proton takes path (a) only when the prefix registry carries
+`SteamGameId` and a working `vrclient.so`; DroidDeck's Proton builds may
+differ, so check both before assuming the thunk loads.
+Fallback: OpenComposite plus a Windows OpenXR runtime inside the prefix,
+which avoids the thunks entirely (WinlatorXR's proven path). Also untested:
+needs a signed-in Steam with a VR title.
+
+## Quest 3 switches for Proton games
+
+From PLAN.md section 12.A.5; each targets a WinlatorXR-observed symptom.
+All three are untested on DroidDeck's DXVK/Turnip builds.
+
+```sh
+tools/droiddeckctl env set DXVK_DISABLE_TIMELINE_SEMAPHORES=1
+tools/droiddeckctl env set TU_DEBUG=noconform
+tools/droiddeckctl env set MESA_VK_WSI_PRESENT_MODE=mailbox
+```
+
+`DXVK_DISABLE_TIMELINE_SEMAPHORES=1` targets timeline-semaphore trouble on
+Adreno 740 under Horizon; `TU_DEBUG=noconform` drops the sysmem path;
+`MESA_VK_WSI_PRESENT_MODE=mailbox` matches WinlatorXR's present mode.
 
 ## Limitations and unknowns
+
 
 - No virtual pad or Bluetooth gamepad in VR: `input pad`, `stick` and
   `trigger` answer `NO_PAD` in a vr session. Keys, text, taps and swipes

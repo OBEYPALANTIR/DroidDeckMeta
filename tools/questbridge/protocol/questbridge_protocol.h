@@ -1,7 +1,8 @@
 /*
  * questbridge_protocol.h - the wire between libopenxr_questbridge.so (the OpenXR runtime inside the
  * Linux guest, glibc) and the xr-bridge-service inside the DroidDeck app (bionic). Both sides include
- * this one header; nothing else about the wire is shared.
+ * this one header; nothing else about the wire is shared. QB_PROTOCOL_VERSION stays 1 for the
+ * qb_space_location velocity carrier below (service and guest build together).
  *
  * Transport: one AF_UNIX SOCK_SEQPACKET connection per XrInstance, path in $DROIDDECK_XR_SOCKET. Every
  * message is one datagram: struct qb_hdr, then the opcode's body struct, then nothing. File
@@ -203,6 +204,10 @@ struct qb_space_location {
     struct qb_status status;
     uint64_t location_flags;            /* XrSpaceLocationFlags */
     struct qb_posef pose;
+    uint64_t velocity_flags;            /* XrSpaceVelocityFlags, 0 when the runtime reported none */
+    float linear[3];                    /* m/s, in base-space coordinates; zeroed with the flags */
+    float angular[3];                   /* rad/s, in base-space coordinates; zeroed with the flags */
+    uint32_t pad2[2];                   /* keeps the struct 8-byte aligned (88 bytes total) */
 };
 
 enum qb_layer_type {

@@ -248,11 +248,17 @@ XrResult qb_xrDestroySpace(XrSpace space) {
 }
 
 /* Lock held: `sp` in `base`, as inverse(base offset) * LOCATE_SPACE * (sp offset); flags 0 while either
- * cannot be located. */
+ * cannot be located. Velocities go through the same composition: the offsets are rigid transforms, so
+ * each wire vector is rotated by the inverse of the base offset's orientation (magnitudes unchanged);
+ * vf/linear/angular are untouched when the app chained no velocity (NULL). */
 static XrResult locate(const struct qb_space_handle *sp, const struct qb_space_handle *base, XrTime time,
-                       XrSpaceLocationFlags *flags, XrPosef *pose) {
+                       XrSpaceLocationFlags *flags, XrPosef *pose, XrSpaceVelocityFlags *vf, XrVector3f *linear,
+                       XrVector3f *angular) {
     *flags = 0;
     *pose = identity;
+    if (vf) *vf = 0;
+    if (linear) *linear = (XrVector3f){0.0f, 0.0f, 0.0f};
+    if (angular) *angular = (XrVector3f){0.0f, 0.0f, 0.0f};
     struct qb_locate_space req = {.time = time};
     if (!space_base(sp, &req.space) || !space_base(base, &req.base_space)) return XR_SUCCESS;
     struct qb_space_location loc;
@@ -261,6 +267,16 @@ static XrResult locate(const struct qb_space_handle *sp, const struct qb_space_h
     if (XR_FAILED(r)) return r;
     *flags = loc.location_flags;
     *pose = qb_pose_mul(qb_pose_mul(qb_pose_inv(base->offset), qb_pose_from_wire(&loc.pose)), sp->offset);
+    if (vf) {
+        *vf = loc.velocity_flags;
+        if (loc.velocity_flags && linear && angular) {
+            /* inverse(base offset) as a rotation: conjugate of a unit quaternion */
+            XrQuaternionf inv = {-base->offset.orientation.x, -base->offset.orientation.y,
+                                 -base->offset.orientation.z, base->offset.orientation.w};
+            *linear = qb_quat_rotate(inv, (XrVector3f){loc.linear[0], loc.linear[1], loc.linear[2]});
+            *angular = qb_quat_rotate(inv, (XrVector3f){loc.angular[0], loc.angular[1], loc.angular[2]});
+        }
+    }
     return XR_SUCCESS;
 }
 
@@ -271,12 +287,20 @@ XrResult qb_xrLocateSpace(XrSpace space, XrSpace baseSpace, XrTime time, XrSpace
         return XR_ERROR_VALIDATION_FAILURE;
     if (time <= 0) return XR_ERROR_TIME_INVALID;
     XrSpaceVelocity *velocity = NULL;
-    for (XrBaseOutStructure *n = location->next; n; n = n->next)
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)location->next; n; n = n->next)
         if (n->type == XR_TYPE_SPACE_VELOCITY) velocity = (XrSpaceVelocity *)n;
     struct qb_session *s = sp->sess;
     QB_LOCK(s->inst);
-    if (velocity) velocity->velocityFlags = 0; /* the wire carries no velocities */
-    XrResult r = locate(sp, base, time, &location->locationFlags, &location->pose);
+    XrResult r;
+    if (velocity) {
+        velocity->velocityFlags = 0;
+        velocity->linearVelocity = (XrVector3f){0.0f, 0.0f, 0.0f};
+        velocity->angularVelocity = (XrVector3f){0.0f, 0.0f, 0.0f};
+        r = locate(sp, base, time, &location->locationFlags, &location->pose, &velocity->velocityFlags,
+                   &velocity->linearVelocity, &velocity->angularVelocity);
+    } else {
+        r = locate(sp, base, time, &location->locationFlags, &location->pose, NULL, NULL, NULL);
+    }
     return XR_FAILED(r) ? r : qb_session_result(s, XR_SUCCESS);
 }
 
@@ -302,9 +326,20 @@ XrResult qb_xrLocateSpaces(XrSession session, const XrSpacesLocateInfo *info, Xr
         const struct qb_space_handle *sp = qb_space_handle_get(info->spaces[i]);
         if (!sp) return XR_ERROR_HANDLE_INVALID;
         if (sp->sess != s) return XR_ERROR_VALIDATION_FAILURE;
-        XrResult r = locate(sp, base, info->time, &locations->locations[i].locationFlags, &locations->locations[i].pose);
+        XrSpaceVelocityData *v = velocities ? &velocities->velocities[i] : NULL;
+        XrResult r;
+        if (v) {
+            v->velocityFlags = 0;
+            v->linearVelocity = (XrVector3f){0.0f, 0.0f, 0.0f};
+            v->angularVelocity = (XrVector3f){0.0f, 0.0f, 0.0f};
+            r = locate(sp, base, info->time, &locations->locations[i].locationFlags,
+                       &locations->locations[i].pose, &v->velocityFlags, &v->linearVelocity,
+                       &v->angularVelocity);
+        } else {
+            r = locate(sp, base, info->time, &locations->locations[i].locationFlags,
+                       &locations->locations[i].pose, NULL, NULL, NULL);
+        }
         if (XR_FAILED(r)) return r;
-        if (velocities) velocities->velocities[i].velocityFlags = 0;
     }
     return qb_session_result(s, XR_SUCCESS);
 }

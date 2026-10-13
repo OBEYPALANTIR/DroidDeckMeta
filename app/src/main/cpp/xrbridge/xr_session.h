@@ -40,15 +40,16 @@
 
 namespace xrbridge {
 
-// Runtime extensions the bridge plans around. Only XR_KHR_vulkan_enable2 and
-// XR_KHR_android_create_instance (both required), XR_KHR_android_surface_swapchain and
-// XR_FB_display_refresh_rate (each when present) are enabled.
+// Runtime extensions the bridge plans around: XR_KHR_vulkan_enable2 and
+// XR_KHR_android_create_instance (both required), the rest each enabled when present.
 struct RuntimeExtensions {
     bool androidSurfaceSwapchain = false;      // XR_KHR_android_surface_swapchain, enabled when present
     bool compositionLayerDepth = false;        // XR_KHR_composition_layer_depth
     bool displayRefreshRate = false;           // XR_FB_display_refresh_rate, enabled when present
     bool compositionLayerImageLayout = false;  // XR_FB_composition_layer_image_layout
     bool handTracking = false;                 // XR_EXT_hand_tracking
+    bool androidThreadSettings = false;        // XR_KHR_android_thread_settings, enabled when present
+    bool performanceSettings = false;          // XR_EXT_performance_settings, enabled when present
 };
 
 // Device extensions for sharing images and fences with the guest, each enabled when the device
@@ -111,6 +112,9 @@ public:
     XrSpace gripSpace(int hand) const { return hands_[hand].grip; }
     XrSpace aimSpace(int hand) const { return hands_[hand].aim; }
     bool locateSpace(XrSpace space, XrSpace base, XrTime time, XrSpaceLocation &out);
+    // Same, chaining velocity (XR_TYPE_SPACE_VELOCITY) onto out.next for the call so the runtime
+    // fills it; null chains nothing. out.next is restored before returning.
+    bool locateSpace(XrSpace space, XrSpace base, XrTime time, XrSpaceLocation &out, XrSpaceVelocity *velocity);
     bool applyHaptic(int hand, XrDuration duration, float frequency, float amplitude);
 
     // VIEW and LOCAL always exist after init(); STAGE only when the runtime offers it, else XR_NULL_HANDLE.
@@ -119,6 +123,16 @@ public:
     bool stageBounds(XrExtent2Df &bounds);
     // Through XR_FB_display_refresh_rate (0 = the runtime's choice); false without the extension.
     bool requestRefreshRate(float rate);
+    // XR_KHR_android_thread_settings; false without the extension. applyThreadHints marks the
+    // calling (frame) thread XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR; the session calls it once
+    // after creating the session. markApplicationThread marks the calling thread as type, so the
+    // service can later mark its own threads (e.g. its socket thread APPLICATION_WORKER_KHR).
+    bool applyThreadHints();
+    bool markApplicationThread(XrAndroidThreadTypeKHR type);
+    // XR_EXT_performance_settings; false without the extension. The session calls it once after
+    // xrBeginSession with SUSTAINED_HIGH for both (WinlatorXR's Quest 3 choice; BOOST is reserved
+    // for short bursts); later calls re-apply, and the runtime reports changes through pollEvents.
+    bool setPerformanceLevels(XrPerfSettingsLevelEXT cpu, XrPerfSettingsLevelEXT gpu);
 
     // Swapchains whose images take colour-attachment writes and transfers (clears, copies). An
     // acquired image arrives in COLOR_ATTACHMENT_OPTIMAL and must be released in it, with the
@@ -210,6 +224,9 @@ private:
     PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate_ = nullptr;
     PFN_xrRequestDisplayRefreshRateFB requestDisplayRefreshRate_ = nullptr;
     PFN_xrCreateSwapchainAndroidSurfaceKHR createSurfaceSwapchain_ = nullptr;
+    PFN_xrSetAndroidApplicationThreadKHR setApplicationThread_ = nullptr;
+    PFN_xrPerfSettingsSetPerformanceLevelEXT setPerformanceLevel_ = nullptr;
+    bool perfLevelsApplied_ = false;
     XrSpace view_ = XR_NULL_HANDLE;
     XrSpace local_ = XR_NULL_HANDLE;
     XrSpace stage_ = XR_NULL_HANDLE;

@@ -12,6 +12,7 @@
 // Exit 0 after the loop, 1 on any failure. Every stage prints; flush always
 // so a crash still leaves the last stage in the log.
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -324,11 +325,17 @@ int main(int argc, char **argv) {
 		double now = now_s();
 		if (now - last_stat >= 1.0) {
 			const vr::TrackedDevicePose_t *hmd = &poses[vr::k_unTrackedDeviceIndex_Hmd];
-			printf("smoke: t=%.1f frames=%llu fps=%.0f hmd_valid=%d hmd_pos=%.2f,%.2f,%.2f submit_errs=%llu\n",
+			double v = sqrt(hmd->vVelocity.v[0] * hmd->vVelocity.v[0] +
+				hmd->vVelocity.v[1] * hmd->vVelocity.v[1] +
+				hmd->vVelocity.v[2] * hmd->vVelocity.v[2]);
+			double w = sqrt(hmd->vAngularVelocity.v[0] * hmd->vAngularVelocity.v[0] +
+				hmd->vAngularVelocity.v[1] * hmd->vAngularVelocity.v[1] +
+				hmd->vAngularVelocity.v[2] * hmd->vAngularVelocity.v[2]);
+			printf("smoke: t=%.1f frames=%llu fps=%.0f hmd_valid=%d hmd_pos=%.2f,%.2f,%.2f vel |v|=%.2f m/s |w|=%.2f rad/s submit_errs=%llu\n",
 				now - t0, (unsigned long long)frames, frames / (now - t0),
 				hmd->bPoseIsValid, hmd->mDeviceToAbsoluteTracking.m[0][3],
 				hmd->mDeviceToAbsoluteTracking.m[1][3],
-				hmd->mDeviceToAbsoluteTracking.m[2][3],
+				hmd->mDeviceToAbsoluteTracking.m[2][3], v, w,
 				(unsigned long long)submit_errs);
 			last_stat = now;
 		}
