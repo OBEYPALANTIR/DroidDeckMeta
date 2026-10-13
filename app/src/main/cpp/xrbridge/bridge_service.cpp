@@ -382,8 +382,11 @@ bool BridgeService::loop() {
         stats_.frames++;
         if (Clock::now() >= nextLog) {
             nextLog = Clock::now() + std::chrono::seconds(1);
-            LOGI("bridge: %u frames, %u guest frames, %u copies, %u dropped", stats_.frames.exchange(0),
-                 stats_.guestFrames.exchange(0), stats_.copies.exchange(0), stats_.dropped.exchange(0));
+            const HandInput &l = xr_.input(Session::kLeft), &r = xr_.input(Session::kRight);
+            LOGI("bridge: %u frames, %u guest frames, %u copies, %u dropped; touch L active %d buttons 0x%x trigger %.2f squeeze %.2f, R active %d buttons 0x%x trigger %.2f squeeze %.2f",
+                 stats_.frames.exchange(0), stats_.guestFrames.exchange(0), stats_.copies.exchange(0),
+                 stats_.dropped.exchange(0), l.active, l.buttons, l.trigger, l.squeeze, r.active, r.buttons,
+                 r.trigger, r.squeeze);
         }
     }
 }
