@@ -172,6 +172,13 @@ class VrSessionActivity : Activity() {
             runCatching { android.system.Os.setenv("BL_WAYLAND_LOG", waylandLog.path, true) }
                 .onFailure { Log.w(TAG, "could not point the compositor's log at $waylandLog", it) }
         }
+        // The first-frame notice is one-shot in native code and the listener is process-wide: an
+        // earlier session may have spent the notice, and a pause/resume re-attach below never
+        // re-arms it (SessionService.start, the only other re-arm, runs only when starting). While
+        // this session still waits for its first frame, re-register and re-arm so its frames fire.
+        WaylandCompositor.setFirstFrameListener(firstFrame)
+        if (!SessionState.firstFrameSeen) WaylandCompositor.nativeResetFirstFrame()
+        SessionEvents.markReadyIfPossible()
         // A zero-copy game goes onto an Android layer of its own, which the headset never shows.
         WaylandCompositor.nativeSetZeroCopy(false)
         CompositorHost.startOrAttach(
