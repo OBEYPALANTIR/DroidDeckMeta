@@ -234,6 +234,11 @@ vr_environment() {
     mkdir -p "${vrpath%/*}"
     printf '%s\n' '{"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"}' > "$vrpath"
     echo "== vr: OpenVR titles go through xrizer ($vrpath)"
+    # DXVK asks the OpenVR compositor which Vulkan device extensions it needs and enables them blindly;
+    # xrizer answers with the win32 external-memory trio, which no Linux driver has, and
+    # vkCreateDevice fails (DroidDeckMeta loop3-dxvk-bisect). Its presentation does not go through
+    # DXVK anyway. The user's own value, if set, wins.
+    export DXVK_NO_VR=${DXVK_NO_VR:-1}
   fi
 }
 

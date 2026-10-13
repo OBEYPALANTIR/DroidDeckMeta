@@ -72,6 +72,14 @@ class SessionVrTest(unittest.TestCase):
         self.assertEqual({"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"},
                          json.loads(self.vrpath.read_text()))
 
+    def test_dxvk_skips_the_openvr_extension_query_under_xrizer_unless_the_user_says_otherwise(self):
+        # xrizer answers that query with win32 extensions no Linux driver has; DXVK then fails
+        # vkCreateDevice. Without xrizer nothing asks DXVK anything.
+        self.assertNotIn("DXVK_NO_VR", self.exported())
+        self.xrizer.mkdir()
+        self.assertEqual("1", self.exported()["DXVK_NO_VR"])
+        self.assertEqual("0", self.exported(DXVK_NO_VR="0")["DXVK_NO_VR"])
+
 
 if __name__ == "__main__":
     unittest.main()
