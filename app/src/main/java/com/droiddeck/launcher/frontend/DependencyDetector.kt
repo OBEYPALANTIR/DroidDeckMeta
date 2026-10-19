@@ -112,7 +112,9 @@ object DependencyDetector {
 
         fun consider(f: File, isDir: Boolean, insideRedist: Boolean) {
             val name = f.name.lowercase(Locale.US)
-            val path = f.path.replace('\\', '/').lowercase(Locale.US)
+            // Game-relative: an absolute prefix (a temp root's digits, a year in the install
+            // path) must not read as the redist's own version.
+            val path = relativeReason(gameDir, f).replace('\\', '/').lowercase(Locale.US)
             // Bundled = in a redist container or an installer (exe/msi/cab); shipped = a loose runtime DLL.
             val kind = if (insideRedist || isDir || name.endsWith(".exe") || name.endsWith(".msi") || name.endsWith(".cab"))
                 Kind.BUNDLED else Kind.SHIPPED

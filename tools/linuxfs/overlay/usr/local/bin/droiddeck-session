@@ -4,6 +4,7 @@
 #   droiddeck-session desktop            the file manager
 #   droiddeck-session run <path>         a Linux program (AppImage, script or ELF)
 #   droiddeck-session steam [steam-url]  the native Steam client
+#   droiddeck-session vr [steam-url]     the same, with the Quest's OpenXR bridge for its games
 #   droiddeck-session lxqt               the KDE Plasma desktop (DroidDeck's desktop package)
 # BL_WIDTH / BL_HEIGHT size the output, BL_FPS limits it, BL_LOG collects everything said here.
 set -u
@@ -28,6 +29,9 @@ if [ -n "${BL_LOG:-}" ] && [ -z "${BL_INSIDE:-}" ]; then
   echo "== gamescope: $(gamescope --version 2>&1 | head -1) at $(command -v gamescope)"
   echo "== rootfs: $(cat /.version 2>/dev/null || echo unversioned)"
 fi
+# vr is the steam session with the XR bridge as the runtime of everything the client starts
+# (PLAN.md Loop 2 item 8): steam from here on, and BL_VR carries it through gamescope's exec.
+if [ "$mode" = vr ]; then mode=steam; export BL_VR=1; fi
 
 # Every program loads the locale LANG names (C.UTF-8) before main(). glibc ships it as a directory,
 # which it looks for once per category under two spellings before reading gconv's module lists:
@@ -177,6 +181,23 @@ export XDG_DATA_DIRS=$XDG_DATA_HOME/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/
 # program from the rail): the user's game cores when set (BL_GAME_CPUS), else every core but the
 # slowest cluster - Android is free to park an emulator's threads on the little cores, and those
 # are what compile shaders and recompile PPU/SPU code. BL_PIN_CORES=0 leaves the scheduler alone.
+# A prime-only client mask can be reset without a thread-count change (Steam or Android).
+# Read status with shell builtins; only invoke taskset when a single-core mask has drifted.
+client_single_core_matches() {
+  local wanted=$1 task key cpus
+  shift
+  [[ $wanted =~ ^[0-9]+$ ]] || return 0
+  for task in "$@"; do
+    [ -r "$task/status" ] || continue
+    while read -r key cpus; do
+      [ "$key" = Cpus_allowed_list: ] || continue
+      [ "$cpus" = "$wanted" ] || return 1
+      break
+    done < "$task/status" 2>/dev/null
+  done
+  return 0
+}
+
 program_cores() {
   [ "${BL_PIN_CORES:-1}" = 0 ] && return 0
   command -v taskset >/dev/null 2>&1 || return 0
@@ -193,6 +214,30 @@ program_cores() {
     [ "$max" -gt "$min" ] && list="$list${list:+,}$n"
   done
   echo "$list"
+}
+
+# vr mode, for the client and all it starts: the Khronos loader finds the bridge runtime through
+# XR_RUNTIME_JSON and native titles find the loader on LD_LIBRARY_PATH; the runtime reaches the
+# app's service on the abstract socket named for the app's package as the bwrap one is
+# (BwrapSpawner); OpenVR titles find xrizer through the path registry.
+vr_environment() {
+  local xr=/usr/local/lib/droiddeck-xr bwrap=${DROIDDECK_BWRAP_SOCKET:-com.droiddeck.launcher.bwrap}
+  local vrpath=${XDG_CONFIG_HOME:-$HOME/.config}/openvr/openvrpaths.vrpath
+  export XR_RUNTIME_JSON=$xr/questbridge.json
+  export DROIDDECK_XR_SOCKET=@${bwrap%.bwrap}.xr-bridge
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":$xr:"*) ;;
+    *) export LD_LIBRARY_PATH=$xr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ;;
+  esac
+  echo "== vr: OpenXR runtime $XR_RUNTIME_JSON, service $DROIDDECK_XR_SOCKET"
+  [ -f "$XR_RUNTIME_JSON" ] || echo "== vr: this runtime has no $XR_RUNTIME_JSON; OpenXR titles will find no runtime"
+  if [ -d /usr/local/lib/xrizer ]; then
+    mkdir -p "${vrpath%/*}"
+    printf '%s\n' '{"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"}' > "$vrpath"
+    echo "== vr: OpenVR titles go through xrizer ($vrpath)"
+  fi
+  # Without xrizer an existing vrpath is the user's own and is left alone: this
+  # function only writes the registry, never removes it.
 }
 
 if [ -z "${BL_INSIDE:-}" ]; then
@@ -359,7 +404,9 @@ if [ "${BL_DESKTOP:-}" != 1 ] && [ -n "${BL_ANDROID_CLIPBOARD:-}" ] && [ -x /usr
   /usr/local/bin/droiddeck-clipboard "$BL_ANDROID_CLIPBOARD" &
 fi
 
-# KDE already has a session agent; starting another would race its request files.
+# KDE already has a session agent; starting another would race its request files. In vr mode the
+# agent gets the bridge environment too, so `droiddeckctl guest` runs OpenXR programs as Steam would.
+[ "${BL_VR:-}" = 1 ] && vr_environment
 [ "${BL_DESKTOP:-}" = 1 ] || start_agent
 
 case $mode in
@@ -445,8 +492,8 @@ case $mode in
     # reasonable thing to do while a game is running and the wrong thing when the client is all
     # there is. BL_CLIENT_CPUS overrides it. Re-applied on a beat because steamwebhelper spawns
     # children continuously and each one inherits Steam's choice, not ours. The beat reads /proc
-    # itself instead of running pgrep, and only runs taskset for a process that is new or has
-    # grown threads since it was last pinned: every fork is a round of traced syscalls, and a
+    # itself instead of running pgrep, and runs taskset for new threads or a single-core mask
+    # that has drifted since it was last pinned: every fork is a round of traced syscalls, and a
     # beat that forked a taskset per process every 5 s did that for an hour. taskset -a, because
     # without it only a process's main thread moves and the renderer's workers stay where they were.
     if [ -n "${BL_CLIENT_CPUS:-}" ]; then
@@ -459,7 +506,9 @@ case $mode in
             case $_c in *steamwebhelper*|*steamrtarm64/steam|*gamescope*) ;; *) continue ;; esac
             _t=("$_d"/task/*)
             _p=${_d#/proc/}
-            [ "${_bl_pinned[$_p]:-}" = "${#_t[@]}" ] && continue
+            if [ "${_bl_pinned[$_p]:-}" = "${#_t[@]}" ] && client_single_core_matches "$BL_CLIENT_CPUS" "${_t[@]}"; then
+              continue
+            fi
             taskset -a -cp "$BL_CLIENT_CPUS" "$_p" >/dev/null 2>&1 || true
             _bl_pinned[$_p]=${#_t[@]}
           done
@@ -802,6 +851,9 @@ BUSCONF
     fi
 
     export STEAM_RUNTIME=1
+    # Before the client's own libraries go first: Proton's launcher drops only those
+    # (steam-compatibility's bl_libpath), so the bridge's loader stays on its games' path too.
+    [ "${BL_VR:-}" = 1 ] && vr_environment
     export LD_LIBRARY_PATH=$steam_root/steamrtarm64:$steam_root/steamrtarm64/panorama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     export SDL_VIDEO_X11_DGAMOUSE=0
     # Decky is optional and session scoped: the app's marker opts in, and this supervisor is
@@ -884,6 +936,12 @@ BUSCONF
       export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
       echo "== steam: Deck mode on (-steamdeck -steamos3)"
     fi
+    # The power menu's Shut Down and Restart. Without these the client blanks its interface and
+    # stays up (device, 2026-10-12: System.ShutdownPC and nothing after it). With them it does what
+    # SteamOS's gamescope session expects: writes the sentinel and exits. The loop below ends the
+    # session for one and starts the client again for the other.
+    export STEAMOS_STEAM_SHUTDOWN_SENTINEL="$HOME/.bl-steam-shutdown"
+    export STEAMOS_STEAM_REBOOT_SENTINEL="$HOME/.bl-steam-reboot"
     # What a killed session leaves behind. Android ends sessions without warning (backgrounding, the
     # low-memory killer), and the client then finds .crash - opening its update UI on the spinner -
     # and the web helper's Singleton* locks in htmlcache, owned by a process that is gone, which can
@@ -941,7 +999,7 @@ BUSCONF
     # An update that cannot install asks for a restart (rc=42) every time; the count is capped so a
     # session can never again loop in silence, which reads as a menu opening and closing by itself.
     steam_updates=0
-    rm -f "$HOME/.bl-stop-requested"
+    rm -f "$HOME/.bl-stop-requested" "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" "$STEAMOS_STEAM_REBOOT_SENTINEL"
     # The client brings a game it launched to the front only while it counts someone as present,
     # which it reads from gamescope's input counter. A game the app launches after a few minutes
     # with no touch starts behind the library page and stays there until the next input (device,
@@ -1045,6 +1103,18 @@ BUSCONF
       if [ -f "$HOME/.bl-stop-requested" ]; then
         rm -f "$HOME/.bl-stop-requested" "$HOME/.bl-restart-once"
         break
+      fi
+      if [ -e "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" ]; then
+        rm -f "$STEAMOS_STEAM_SHUTDOWN_SENTINEL" "$STEAMOS_STEAM_REBOOT_SENTINEL"
+        echo "== steam: Shut Down from the power menu; ending the session"
+        rc=0
+        break
+      fi
+      if [ -e "$STEAMOS_STEAM_REBOOT_SENTINEL" ]; then
+        rm -f "$STEAMOS_STEAM_REBOOT_SENTINEL"
+        echo "== steam: Restart from the power menu; starting the client again"
+        set --
+        continue
       fi
       # The session asked for this exit (the ARM64 Proton landed): start again, without the URL
       # arguments, which were acted on. Not counted against the update cap.

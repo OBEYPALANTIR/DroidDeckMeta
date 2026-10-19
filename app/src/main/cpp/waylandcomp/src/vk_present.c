@@ -17,6 +17,7 @@
 #include <poll.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <android/log.h>
 
 #define TAG "DroidDeckWayland"
@@ -39,20 +40,25 @@ struct vkp_image {
 
 static ANativeWindow *g_window;  /* the window frames go to; compositor thread only */
 static char *g_driver_path, *g_library_name, *g_native_lib_dir;
-static int g_dev_state;       /* 0 = not yet, 1 = ok, -1 = failed, -2 = lost (VK_ERROR_DEVICE_LOST) */
+static _Atomic int g_dev_state; /* 0 = not yet, 1 = ok, -1 = failed, -2 = lost. Atomic: vkp_device_failed/lost run on any thread (JNI), the rest on the compositor thread. */
 static VkInstance g_inst;
 static VkPhysicalDevice g_pd;
 static VkDevice g_dev;
 static VkQueue g_queue;
 static uint32_t g_qfam;
 static VkCommandPool g_pool;
-/* One command buffer + acquire/render-done semaphore pair per PRESENT. A scene frame is one
+/* One command buffer + acquire semaphore per PRESENT. A scene frame is one
  * present, or up to 1 + VKP_FG_MAX_GENERATIONS with frame generation (the generated frames go
  * out first, the real frame last), each on its own slot so no semaphore ever carries two
  * pending signals. Slot 0 is also the layer-mode blit's command buffer. */
 #define MAX_PRESENTS (1 + VKP_FG_MAX_GENERATIONS)
 static VkCommandBuffer g_cmds[MAX_PRESENTS];
-static VkSemaphore g_acqs[MAX_PRESENTS], g_rnds[MAX_PRESENTS];
+static VkSemaphore g_acqs[MAX_PRESENTS];
+/* One present-wait semaphore per swapchain image, indexed by the acquired image: the frame fence
+ * proves the submit finished, not that present consumed its semaphore, so a slot-indexed
+ * semaphore can still be owned by the previous present (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+ * Allocated with the swapchain, freed with it. */
+static VkSemaphore *g_present_sems;
 static VkFence g_fence;
 /* Extra swapchain images this swapchain was built with (frame generation: one per generated
  * frame, so all presents of a scene frame queue without waiting for a vblank). */
@@ -98,6 +104,9 @@ static int g_black_state;
  * pool's next copy into that buffer waits for it on the GPU instead of the compositor thread polling it. */
 static PFN_vkImportSemaphoreFdKHR g_import_sem_fd;
 static VkSemaphore g_wait_sem;
+/* VK_EXT_queue_family_foreign is enabled on the device: imported buffers change queue-family
+ * ownership through VK_QUEUE_FAMILY_FOREIGN_EXT, which is invalid without it. */
+static int g_foreign_ext;
 
 /* The 10 s perf line's counters (vkp_perf_take). Compositor thread only. */
 static struct vkp_perf g_perf;
@@ -151,6 +160,7 @@ static PFN_vkSetHdrMetadataEXT g_set_hdr_metadata;
 static uint32_t g_swap_md_identity;
 static int g_surface_formats_said;
 static const char *vk_result_name(VkResult r);
+static void device_lost(const char *where);
 
 /* The Android surface is created/destroyed on the app's UI thread while the compositor thread
  * may be inside a WSI call (acquire and present can block for a refresh or more). The UI thread
@@ -227,10 +237,30 @@ static void reset_sync(void) {
     VkSemaphoreCreateInfo semci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (int k = 0; k < MAX_PRESENTS; k++) {
         if (g_acqs[k]) g_vk.DestroySemaphore(g_dev, g_acqs[k], NULL);
-        if (g_rnds[k]) g_vk.DestroySemaphore(g_dev, g_rnds[k], NULL);
+        g_acqs[k] = VK_NULL_HANDLE;
         g_vk.CreateSemaphore(g_dev, &semci, NULL, &g_acqs[k]);
-        g_vk.CreateSemaphore(g_dev, &semci, NULL, &g_rnds[k]);
     }
+}
+
+static void destroy_present_sems(void) {
+    if (!g_present_sems) return;
+    for (uint32_t i = 0; i < g_nimg; i++)
+        if (g_present_sems[i]) g_vk.DestroySemaphore(g_dev, g_present_sems[i], NULL);
+    free(g_present_sems);
+    g_present_sems = NULL;
+}
+
+/* One present-wait semaphore per swapchain image (see g_present_sems). 0 = ready. */
+static int create_present_sems(void) {
+    g_present_sems = calloc(g_nimg ? g_nimg : 1, sizeof(*g_present_sems));
+    if (!g_present_sems) return -1;
+    VkSemaphoreCreateInfo semci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (uint32_t i = 0; i < g_nimg; i++)
+        if (g_vk.CreateSemaphore(g_dev, &semci, NULL, &g_present_sems[i]) != VK_SUCCESS) {
+            destroy_present_sems();
+            return -1;
+        }
+    return 0;
 }
 
 static void destroy_swapchain(void) {
@@ -238,6 +268,7 @@ static void destroy_swapchain(void) {
     if (g_dev_state != 1) return;
     g_vk.DeviceWaitIdle(g_dev);
     reset_sync();
+    destroy_present_sems();
     for (uint32_t i = 0; i < g_nimg; i++) blendp_forget_image(g_images[i]);
     if (g_swapchain) g_vk.DestroySwapchainKHR(g_dev, g_swapchain, NULL);
     g_swapchain = VK_NULL_HANDLE;
@@ -302,6 +333,7 @@ int vkp_has_window(void) {
 }
 
 int vkp_device_lost(void) { return g_dev_state == -2; }
+int vkp_device_failed(void) { return g_dev_state < 0; }
 
 void vk_present_set_scale_mode(int mode, int alignment) {
     if (mode < VKP_MODE_OFF || mode > VKP_MODE_INTEGER) mode = VKP_MODE_FIT;
@@ -464,9 +496,9 @@ static int dev_init(void) {
     g_vk.GetPhysicalDeviceMemoryProperties(g_pd, &g_memprops);
 
     /* Verify the dmabuf-import extensions are present, and log any that are missing. */
-    const char *dev_exts[7] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_external_memory_fd",
+    const char *dev_exts[8] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_external_memory_fd",
                                "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier",
-                               "VK_KHR_image_format_list", NULL, NULL};
+                               "VK_KHR_image_format_list", NULL, NULL, NULL};
     uint32_t n_dev_exts = 5;
     uint32_t ne = 0;
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
@@ -485,6 +517,11 @@ static int dev_init(void) {
      * back to waiting for them on the CPU without it. */
     const int want_sem_fd = has_ext(exts, ne, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
     if (want_sem_fd) dev_exts[n_dev_exts++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
+    /* Imported buffers are acquired from / released to VK_QUEUE_FAMILY_FOREIGN_EXT: without the
+     * extension those barriers are invalid, so every dma-buf import is refused instead (below). */
+    const int want_foreign = has_ext(exts, ne, "VK_EXT_queue_family_foreign");
+    if (want_foreign) dev_exts[n_dev_exts++] = "VK_EXT_queue_family_foreign";
+    else LOGE("present: driver MISSING VK_EXT_queue_family_foreign (dmabuf import will fail)");
     free(exts);
 
     float prio = 1.0f;
@@ -510,6 +547,7 @@ static int dev_init(void) {
         LOGE("present: vkCreateDevice failed"); g_dev_state = -1; return -1;
     }
     vk_loader_load_device(g_dev);
+    g_foreign_ext = want_foreign;
     g_vk.GetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
     if (want_sem_fd) {
         g_import_sem_fd = (PFN_vkImportSemaphoreFdKHR)g_vk.GetDeviceProcAddr(g_dev, "vkImportSemaphoreFdKHR");
@@ -779,6 +817,7 @@ static int swap_init_locked(void) {
     g_vk.GetSwapchainImagesKHR(g_dev, g_swapchain, &g_nimg, NULL);
     g_images = calloc(g_nimg, sizeof(VkImage));
     g_vk.GetSwapchainImagesKHR(g_dev, g_swapchain, &g_nimg, g_images);
+    if (create_present_sems() != 0) { SWLOGE("present: no present semaphores"); return -1; }
 
     droiddeck_log("gpu", "screen output %ux%u, %u buffers, vsync%s", g_extent.width, g_extent.height, g_nimg,
                g_swap_extra ? " (frame generation: several presents per frame)" : "");
@@ -790,6 +829,16 @@ static int memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
         if ((bits & (1u << i)) && (g_memprops.memoryTypes[i].propertyFlags & want) == want)
             return (int)i;
     return -1;
+}
+
+/* Wait for a one-shot submit (black image, layer blit, cursor readback, effects pass): a 1 s timeout
+ * leaves the shared command buffer and fence pending, so keep waiting without a bound - as the frame
+ * path does - until completion is proven. Returns the final wait result. */
+static VkResult wait_proven(VkFence fence, const char *what) {
+    VkResult fr = timed_wait(fence, 1000000000ULL);
+    if (fr == VK_SUCCESS || fr == VK_ERROR_DEVICE_LOST) return fr;
+    LOGE("present: %s fence wait -> %s after 1 s; waiting for completion", what, vk_result_name(fr));
+    return timed_wait(fence, UINT64_MAX);
 }
 
 /* The small black image the letterbox bars are blitted from (see g_black_img): created, cleared and left
@@ -842,11 +891,17 @@ static void init_black_image(void) {
     g_vk.EndCommandBuffer(cmd);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
     g_vk.ResetFences(g_dev, 1, &g_fence);
-    if (g_vk.QueueSubmit(g_queue, 1, &si, g_fence) == VK_SUCCESS &&
-        g_vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, 1000000000ULL) == VK_SUCCESS)
-        g_black_state = 1;
-    else
+    if (g_vk.QueueSubmit(g_queue, 1, &si, g_fence) != VK_SUCCESS) {
         droiddeck_log("gpu", "letterbox black image unavailable: the whole output is cleared every copy-path frame");
+        return;
+    }
+    VkResult wr = wait_proven(g_fence, "letterbox black image");
+    if (wr == VK_SUCCESS) g_black_state = 1;
+    else if (wr == VK_ERROR_DEVICE_LOST) device_lost("black image");
+    else {
+        LOGE("present: black image completion unproven (%s): stopping", vk_result_name(wr));
+        g_dev_state = -1;
+    }
 }
 
 /* Blit the black image over everything of swapchain image `img` (in TRANSFER_DST_OPTIMAL) OUTSIDE the
@@ -955,6 +1010,11 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
                                           uint32_t stride, uint32_t offset, int as_blit_dst) {
     if (modifier == MOD_INVALID || w <= 0 || h <= 0) return NULL;
     if (dev_init() != 0) return NULL;
+    if (!g_foreign_ext) {
+        LOGE("%s: cannot import a dma-buf without VK_EXT_queue_family_foreign (ownership needs FOREIGN)",
+             as_blit_dst ? "layer" : "dmabuf");
+        return NULL;
+    }
 
     struct vkp_image *img = calloc(1, sizeof(*img));
     if (!img) return NULL;
@@ -998,6 +1058,17 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
     }
     VkMemoryRequirements req;
     g_vk.GetImageMemoryRequirements(g_dev, img->image, &req);
+    /* The computed footprint must fit the buffer it aliases: a wrong pitch, offset or layout would
+     * otherwise read/write past the dma-buf's end. */
+    {
+        off_t fd_len = lseek(dupfd, 0, SEEK_END);
+        if (fd_len < 0 || (VkDeviceSize)fd_len < req.size || (VkDeviceSize)offset > (VkDeviceSize)fd_len) {
+            LOGE("%s: the %s dma-buf holds %lld bytes but the %dx%d image needs %llu (pitch %u, offset %u): refusing the import",
+                 as_blit_dst ? "layer" : "dmabuf", vkp_modifier_name(modifier), (long long)fd_len, w, h,
+                 (unsigned long long)req.size, stride, offset);
+            g_vk.DestroyImage(g_dev, img->image, NULL); close(dupfd); free(img); return NULL;
+        }
+    }
     uint32_t bits = req.memoryTypeBits & allowed;
     int idx = -1;
     for (int i = 0; i < 32; i++) if (bits & (1u << i)) { idx = i; break; }
@@ -1305,6 +1376,7 @@ static void device_lost(const char *where) {
     droiddeck_log("error", "GPU device lost (VK_ERROR_DEVICE_LOST in %s): the compositor has stopped presenting; "
                "restart the session", where);
     for (uint32_t i = 0; i < g_nimg; i++) blendp_forget_image(g_images[i]);
+    destroy_present_sems();
     if (g_swapchain) g_vk.DestroySwapchainKHR(g_dev, g_swapchain, NULL);
     g_swapchain = VK_NULL_HANDLE;
     if (g_surface) g_vk.DestroySurfaceKHR(g_inst, g_surface, NULL);
@@ -1464,8 +1536,9 @@ int vkp_can_wait_sync_fd(void) { return g_import_sem_fd != NULL && g_wait_sem !=
 
 /* Hand a sync_file to the next submit as a GPU wait (temporary import into g_wait_sem; the driver
  * owns the fd from then on). Returns 1 when the submit must wait on g_wait_sem, 0 when there is nothing
- * to wait on - the fd was -1, or it could not be imported and was waited for on the CPU (bounded) and
- * closed instead. -1 = the display is still reading the buffer after 100 ms: do not write it. */
+ * to wait on - the fd was -1, or it could not be imported and signalled on the CPU (bounded) and was
+ * closed instead. -2 = the CPU wait timed out or failed: the fence is lost with the fd, so the caller
+ * must quarantine the buffer, never reuse it as free. */
 static int take_wait_fd(int fd) {
     if (fd < 0) return 0;
     if (vkp_can_wait_sync_fd()) {
@@ -1485,8 +1558,11 @@ static int take_wait_fd(int fd) {
     struct pollfd p = {.fd = fd, .events = POLLIN};
     int r;
     do { r = poll(&p, 1, 100); } while (r < 0 && errno == EINTR);
+    if (r > 0) { close(fd); return 0; }
+    if (r == 0) LOGE("layer: release fence wait timed out (100 ms): quarantining the buffer");
+    else LOGE("layer: release fence poll failed (%s): quarantining the buffer", strerror(errno));
     close(fd);
-    return r == 0 ? -1 : 0;
+    return -2;
 }
 
 /* The HDR10 swapchain's metadata: the game's SMPTE 2086 / CTA-861.3 values (its image description) via
@@ -1627,7 +1703,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         if (seen || !im) continue;
         if (im->dmabuf) {
             bars[nb++] = (VkImageMemoryBarrier){
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
                 .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
@@ -1641,7 +1717,10 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
             im->in_general = 1;
         }
     }
+    /* TRANSFER in the source scope: the submit waits for the acquire semaphore there, and the
+     * swapchain-image transition must chain after that wait (the pass adds ALL_COMMANDS anyway). */
     g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT |
                                  (pass ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0),
                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
     free(bars);
@@ -1696,6 +1775,30 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
                     pass ? scene_w : (int)g_extent.width, pass ? scene_h : (int)g_extent.height,
                     pass ? VK_FILTER_LINEAR : blit_filter);
         drawn++;
+    }
+    /* Imported sources go back to their producer (FOREIGN) in the sharing layout once read; the
+     * next frame acquires them from there. Covers blit and blend (sampled) reads. */
+    {
+        VkImageMemoryBarrier *rels = n > 0 ? calloc((size_t)n, sizeof(*rels)) : NULL;
+        if (n > 0 && !rels) { g_vk.EndCommandBuffer(cmd); return -1; }
+        int nr = 0;
+        for (int i = 0; i < n; i++) {
+            struct vkp_image *im = draws[i].img;
+            int seen = 0;
+            for (int j = 0; j < i; j++) if (draws[j].img == im) { seen = 1; break; }
+            if (seen || !im || !im->dmabuf) continue;
+            rels[nr++] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = g_qfam, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                .image = im->image, .subresourceRange = range,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        }
+        if (nr > 0)
+            g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    0, 0, NULL, 0, NULL, (uint32_t)nr, rels);
+        free(rels);
     }
 
     int ngen = 0;
@@ -1777,7 +1880,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
                            .pWaitSemaphores = &g_acqs[k], .pWaitDstStageMask = &wait, .commandBufferCount = 1,
-                           .pCommandBuffers = &g_cmds[k], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rnds[k]};
+                           .pCommandBuffers = &g_cmds[k], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_present_sems[img]};
         VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, last ? g_fence : VK_NULL_HANDLE);
         if (qr != VK_SUCCESS) {
             if (qr == VK_ERROR_DEVICE_LOST) device_lost("submit");
@@ -1788,7 +1891,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         }
         fence_submitted = last;
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-                               .pWaitSemaphores = &g_rnds[k], .swapchainCount = 1,
+                               .pWaitSemaphores = &g_present_sems[img], .swapchainCount = 1,
                                .pSwapchains = &g_swapchain, .pImageIndices = &img};
         const int64_t t_pres = perf_now();
         pr = g_vk.QueuePresentKHR(g_queue, &pi);
@@ -1805,6 +1908,11 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     VkResult fr = timed_wait(g_fence, UINT64_MAX);
     if (fg) vkp_framegen_presented(presented_gen);
     if (fr == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
+    if (fr != VK_SUCCESS) { /* completion unproven: idle (proves it) before anything is reused */
+        LOGE("present: frame fence wait -> %s", vk_result_name(fr));
+        destroy_swapchain();
+        return -1;
+    }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {
         /* The surface changed or went away under this frame: rebuild before the next one. */
         droiddeck_log("gpu", "screen surface %s on present: rebuilding the swapchain", vk_result_name(pr));
@@ -1908,7 +2016,7 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
         return -1;
     }
     const int gpu_wait = take_wait_fd(wait_fd); /* the display's release of dst, before the copy writes it */
-    if (gpu_wait < 0) return -1;
+    if (gpu_wait < 0) return gpu_wait; /* -2 quarantines dst (see take_wait_fd) */
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     VkCommandBuffer g_cmd = g_cmds[0];
@@ -1917,7 +2025,7 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     g_vk.BeginCommandBuffer(g_cmd, &bi);
     VkImageMemoryBarrier acq[2] = {
-        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
          .srcQueueFamilyIndex = src->dmabuf ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED,
          .dstQueueFamilyIndex = src->dmabuf ? g_qfam : VK_QUEUE_FAMILY_IGNORED,
@@ -1942,13 +2050,22 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
     g_vk.CmdBlitImage(g_cmd, src->image,
                       src->dmabuf ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
                       dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
-    VkImageMemoryBarrier rel = {
+    /* Both images go back to FOREIGN in the sharing layout: dst for the display to read, src for its
+     * producer (the next use acquires them from there). */
+    VkImageMemoryBarrier rel[2] = {{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = g_qfam,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .image = dst->image, .subresourceRange = range,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT}};
+    uint32_t nrel = 1;
+    if (src->dmabuf)
+        rel[nrel++] = (VkImageMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = g_qfam,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .image = src->image, .subresourceRange = range,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
     g_vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            0, 0, NULL, 0, NULL, 1, &rel);
+                            0, 0, NULL, 0, NULL, nrel, rel);
     g_vk.EndCommandBuffer(g_cmd);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1962,9 +2079,9 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
         else LOGE("layer: blit submit failed (%d)", (int)qr);
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = wait_proven(g_fence, "layer blit");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("layer blit"); return -1; }
-    if (fr != VK_SUCCESS) { LOGE("layer: blit fence wait -> %s", vk_result_name(fr)); return -1; }
+    if (fr != VK_SUCCESS) { LOGE("layer: blit completion unproven (%s): stopping", vk_result_name(fr)); g_dev_state = -1; return -1; }
     return 0;
 }
 
@@ -2018,7 +2135,7 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     g_vk.BeginCommandBuffer(cmd, &bi);
     VkImageMemoryBarrier acq[2] = {
-        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
          .srcQueueFamilyIndex = src->dmabuf ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED,
          .dstQueueFamilyIndex = src->dmabuf ? g_qfam : VK_QUEUE_FAMILY_IGNORED,
@@ -2057,9 +2174,9 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
         if (qr == VK_ERROR_DEVICE_LOST) device_lost("cursor readback");
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = wait_proven(g_fence, "cursor readback");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("cursor readback"); return -1; }
-    if (fr != VK_SUCCESS) return -1;
+    if (fr != VK_SUCCESS) { LOGE("present: cursor readback completion unproven (%s): stopping", vk_result_name(fr)); g_dev_state = -1; return -1; }
     for (int y = 0; y < src->h; y++)
         memcpy(out + (size_t)y * src->w, (const uint8_t *)g_rb->map + g_rb->offset + (size_t)y * g_rb->row_pitch,
                (size_t)src->w * 4);
@@ -2153,7 +2270,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
         if (seen || !im) continue;
         if (im->dmabuf) {
             bars[nb++] = (VkImageMemoryBarrier){
-                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
                 .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
@@ -2202,6 +2319,30 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
     g_pass.rw = scene_w; g_pass.rh = scene_h;
     g_pass.result = vkp_effects_run(cmd, scene_img, scene_w, scene_h, mapped_w, mapped_h,
                                     &g_pass.rw, &g_pass.rh);
+    /* Imported sources go back to their producer (FOREIGN) in the sharing layout once read; the
+     * copy appended by vkp_pass_copy_to only touches the result and dst. */
+    {
+        VkImageMemoryBarrier *rels = n > 0 ? calloc((size_t)n, sizeof(*rels)) : NULL;
+        if (n > 0 && !rels) { g_vk.EndCommandBuffer(cmd); return -1; }
+        int nr = 0;
+        for (int i = 0; i < n; i++) {
+            struct vkp_image *im = draws[i].img;
+            int seen = 0;
+            for (int j = 0; j < i; j++) if (draws[j].img == im) { seen = 1; break; }
+            if (seen || !im || !im->dmabuf) continue;
+            rels[nr++] = (VkImageMemoryBarrier){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = g_qfam, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+                .image = im->image, .subresourceRange = range,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        }
+        if (nr > 0)
+            g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    0, 0, NULL, 0, NULL, (uint32_t)nr, rels);
+        free(rels);
+    }
     g_pass.active = 1;
     if (rw) *rw = g_pass.rw;
     if (rh) *rh = g_pass.rh;
@@ -2218,7 +2359,7 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
         return -1;
     }
     const int gpu_wait = take_wait_fd(wait_fd); /* the display's release of dst, before the copy writes it */
-    if (gpu_wait < 0) { g_vk.EndCommandBuffer(cmd); return -1; } /* never submitted; reset before its next use */
+    if (gpu_wait < 0) { g_vk.EndCommandBuffer(cmd); return gpu_wait; } /* -2 quarantines dst; never submitted, reset before its next use */
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     VkImageMemoryBarrier acq = {
@@ -2258,9 +2399,9 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
         else LOGE("layer: effects pass submit failed (%d)", (int)qr);
         return -1;
     }
-    VkResult fr = timed_wait(g_fence, 1000000000ULL);
+    VkResult fr = wait_proven(g_fence, "layer pass");
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("layer pass"); return -1; }
-    if (fr != VK_SUCCESS) { LOGE("layer: effects pass fence wait -> %s", vk_result_name(fr)); return -1; }
+    if (fr != VK_SUCCESS) { LOGE("layer: effects pass completion unproven (%s): stopping", vk_result_name(fr)); g_dev_state = -1; return -1; }
     return 0;
 }
 

@@ -173,6 +173,15 @@ class WinCompSourcesTest {
         assertEquals(listOf("vcredist2013" to WinCompSources.Origin.FOLDER), findings.map { it.component to it.origin })
     }
 
+    @Test fun aYearInTheInstallPathIsNotTheRedistsVersion() {
+        val folder = File(tmp.newFolder("2019"), "Unknown").apply { mkdirs() }
+        File(folder, "_CommonRedist/vcredist/2013").mkdirs()
+        File(folder, "_CommonRedist/vcredist/2013/vcredist_x64.exe").writeText("x")
+        val findings = WinCompSources.forGame(app, game(folder, Library.ADDED))
+        assertTrue(auto(findings).isEmpty())
+        assertEquals(listOf("vcredist2013" to WinCompSources.Origin.FOLDER), findings.map { it.component to it.origin })
+    }
+
     // ---- what turns on, and the user's switches ----
 
     private fun ready(name: String) = WinComponents.Component(name, "", "", "ready", emptyList(),

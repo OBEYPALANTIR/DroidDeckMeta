@@ -130,7 +130,8 @@ def start_agent_activity(adb: str, serial: str, request: dict) -> None:
 
 def confirm_start(adb: str, serial: str, request: dict, previous: dict) -> dict:
     deadline = time.monotonic() + 95
-    expected_mode = {"steam": "steam", "desktop": "lxqt", "run": "run"}[request["mode"]]
+    # vr: the app reports a VR session as a Steam one (SessionService.MODE_VR).
+    expected_mode = {"steam": "steam", "vr": "steam", "desktop": "lxqt", "run": "run"}[request["mode"]]
     while True:
         state = get_state(adb, serial)
         session = state.get("session", {})
@@ -333,7 +334,7 @@ def execute(args: argparse.Namespace, adb: str, serial: str) -> dict:
 
     if command == "start":
         request = {"mode": args.mode}
-        if args.mode == "steam":
+        if args.mode in ("steam", "vr"):
             if args.ui == "desktop":
                 request["steamUi"] = "desktop"
             if args.url:
@@ -344,8 +345,11 @@ def execute(args: argparse.Namespace, adb: str, serial: str) -> dict:
             # A scenario's per-run "before": keep a session of this mode that is already up, so only
             # a run after one that ended (a crash, the low-memory killer) starts a new one.
             current = get_state(adb, serial)["session"]
-            wanted = {"steam": "steam", "desktop": "lxqt"}[args.mode]
-            if current.get("running") and current.get("mode") == wanted and current.get("phase") not in {"STOPPING", "FAILED"}:
+            wanted = {"steam": "steam", "vr": "steam", "desktop": "lxqt"}[args.mode]
+            # Told apart by the session's folder, which a VR session names for vr (VrSessionActivity).
+            vr = str(current.get("id") or "").endswith("-vr")
+            if current.get("running") and current.get("mode") == wanted and vr == (args.mode == "vr") \
+                    and current.get("phase") not in {"STOPPING", "FAILED"}:
                 state = wait_for_phase(adb, serial, "READY", args.timeout) if args.wait else get_state(adb, serial)
                 return add_serial(dict(state, reused=True), serial)
         started = start_session(adb, serial, request)
@@ -530,8 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     state = commands.add_parser("state", help="print machine-readable session state")
     state.add_argument("--json", action="store_true", help="accepted for explicit machine-readable usage")
 
-    start = commands.add_parser("start", help="start Steam or the desktop")
-    start.add_argument("mode", choices=["steam", "desktop"])
+    start = commands.add_parser("start", help="start Steam, Steam in the headset (vr) or the desktop")
+    start.add_argument("mode", choices=["steam", "vr", "desktop"])
     start.add_argument("--ui", choices=["bigpicture", "desktop"], default="bigpicture")
     start.add_argument("--url", help="steam:// URL to pass to the client")
     start.add_argument("--wait", action="store_true", help="wait for READY after starting")

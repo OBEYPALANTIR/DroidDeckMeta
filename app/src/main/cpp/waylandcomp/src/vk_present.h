@@ -91,6 +91,9 @@ int vkp_ready(void);
 int vkp_has_window(void);
 /* 1 once the Vulkan device was lost: nothing is presented any more (the session must restart). */
 int vkp_device_lost(void);
+/* 1 once the device could not be brought up (vkCreateDevice and friends) or was lost: the compositor
+ * presents nothing for the rest of this process. Any thread. */
+int vkp_device_failed(void);
 
 // Clear to black, blit the draws in order (first = bottom) and present.
 // Returns 0 on success, -1 if nothing could be presented (no window yet, etc.).
@@ -145,7 +148,8 @@ int vkp_pass_begin_hdr(int scene_w, int scene_h, const struct vkp_draw *draws, i
 /* ---- layer mode helpers (sc_layer.c; compositor thread) ---- */
 /* Whole-image copy of src into dst (a blit-destination dmabuf image), waited for on the CPU.
  * wait_fd: a sync_file the copy must wait for before writing dst (the display's release fence of that
- * buffer), -1 = none. Always consumed (handed to the GPU, or waited for and closed). */
+ * buffer), -1 = none. Always consumed (handed to the GPU, or waited for and closed). Returns -2 when
+ * the fence wait timed out or failed: the fence is lost, quarantine dst, never reuse it as free. */
 int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd);
 /* A client's GPU cursor (an imported dma-buf, often UBWC) read back as w*h 0xAARRGGBB pixels through a
  * linear host-visible copy; waited for on the CPU. Compositor thread, between frames. 0 = ok. */
@@ -179,7 +183,7 @@ void vkp_signal_first_frame(void);
  * must follow a successful begin. The chain deliberately runs with NO swapchain image acquired -
  * see the comment in vk_present.c. Frame generation is not run here (see WAYLAND_RUNTIME.md). */
 int vkp_pass_begin(int scene_w, int scene_h, const struct vkp_draw *draws, int n, int *rw, int *rh);
-/* wait_fd: as for vkp_blit_image (consumed in every case). */
+/* wait_fd: as for vkp_blit_image (consumed in every case; -2 quarantines dst the same way). */
 int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd);
 void vkp_pass_abort(void);
 

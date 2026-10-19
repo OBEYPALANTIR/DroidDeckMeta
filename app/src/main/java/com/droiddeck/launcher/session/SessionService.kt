@@ -89,6 +89,8 @@ class SessionService : Service() {
     private var activityVisible = true
     private var screenOn = true
     private var manualPauseRequested = false
+    /** This session is MODE_VR; SessionState.mode says steam, which is what it is to everything else. */
+    private var vr = false
     /** An explicit Steam sleep request is independent of the background policy. */
     private var steamSleepToken: String? = null
     private var nativeSleepToken: String? = null
@@ -213,6 +215,8 @@ class SessionService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        // Before the notification: its taps open the activity the session is shown in.
+        if (!SessionState.running) vr = intent?.getStringExtra(EXTRA_MODE) == MODE_VR
         startForeground(NOTIFICATION_ID, buildNotification())
         if (SessionState.running) return START_NOT_STICKY
         if (SessionState.stopRequested) {
@@ -220,7 +224,7 @@ class SessionService : Service() {
             stopSession(0)
             return START_NOT_STICKY
         }
-        SessionState.mode = intent?.getStringExtra(EXTRA_MODE) ?: MODE_STEAM
+        SessionState.mode = if (vr) MODE_STEAM else intent?.getStringExtra(EXTRA_MODE) ?: MODE_STEAM
         suspendPolicy = SessionPrefs.suspendPolicy(this, SessionState.mode)
         steamDownloadsInBackground = SessionPrefs.steamDownloadsInBackground(this)
         activityVisible = true
@@ -334,6 +338,7 @@ class SessionService : Service() {
         SessionFiles.stage(this, root)
         com.droiddeck.launcher.agent.AgentGuest.reset(this)
         // The compat tool asks for an Epic game's sign-in code at every launch, the client's Play button included.
+        com.droiddeck.launcher.stores.gog.GogComet.begin()
         com.droiddeck.launcher.stores.StoreLaunchRequests.start(this)
 
         val sessionDir = openSessionFolder()
@@ -410,7 +415,7 @@ class SessionService : Service() {
             add("cd \"\$HOME\" && exec /bin/bash -i")
         }
         guest.add(LinuxRuntime.SESSION_SCRIPT)
-        guest.add(SessionState.mode)
+        guest.add(if (vr) MODE_VR else SessionState.mode)
         if (SessionState.mode == MODE_STEAM) SessionState.steamUrl?.takeIf { it.startsWith("steam://") }?.let {
             guest.add(it)
             Log.i(TAG, "steam: handing the client $it")
@@ -584,6 +589,8 @@ class SessionService : Service() {
     private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean) {
         guest.add("/usr/bin/env")
         guest.add("-i")
+        // PRoot executes guest[0] directly; assignments belong after env -i.
+        guest.add("DROIDDECK_BWRAP_SOCKET=" + com.droiddeck.launcher.runtime.BwrapSpawner.socket(this))
         guest.add("HOME=/root")
         guest.add("USER=root")
         guest.add("PATH=/usr/local/bin:/usr/bin:/bin")
@@ -666,16 +673,15 @@ class SessionService : Service() {
         extraEnv().forEach { guest.add(it) }
         // The agent bridge's experiment lines (AgentEnv), after the user's so an agent's win.
         com.droiddeck.launcher.agent.AgentEnv.beginSession(this).forEach { guest.add(it) }
-        // Core masks, Bannerlator's two (cfca3912). The client's is sent whenever the override is
-        // on, even naming every core: it exists to undo the pin Steam applies to its own interface
-        // renderer, and the scheduler's default is exactly what that pin takes away. A game's is
-        // sent only when it is a real restriction - a game has no pin of its own to undo.
-        if (steamHere && SessionPrefs.clientCpusOverride(this)) {
+        // A game launched by pinned Steam inherits its mask. Explicitly restore all game cores
+        // when requested, as well as applying restricted game choices in the Proton wrapper.
+        val clientPinned = steamHere && SessionPrefs.clientCpusOverride(this)
+        if (clientPinned) {
             guest.add("BL_CLIENT_CPUS=" + CpuCores.listOrAll(SessionPrefs.clientCpus(this)))
         }
         // The game cores also pin the desktop and a program from the rail; without a choice the
         // session script picks every core but the slowest cluster for those (program_cores).
-        CpuCores.restrictionOrEmpty(SessionPrefs.gameCpus(this))
+        CpuCores.gameLaunchList(SessionPrefs.gameCpus(this), clientPinned)
             .takeIf { it.isNotEmpty() }?.let { guest.add("BL_GAME_CPUS=$it") }
     }
 
@@ -1541,6 +1547,7 @@ class SessionService : Service() {
         }
         updateDownloadMonitoring()
         val stoppedGen = sessionGen
+        val stoppedSession = SessionState.sessionId
         SessionState.stopRequested = false
         SessionEvents.record("guest.exited", mapOf("status" to status))
         GpuClockPin.stop(this)
@@ -1587,13 +1594,14 @@ class SessionService : Service() {
             if (prootPid > 1 || auxiliary.isNotEmpty()) {
                 Thread({
                     if (prootPid > 1 && steamClientMayRun) askSteamToExit(prootPid)
+                    com.droiddeck.launcher.stores.gog.GogComet.end(stoppedSession)
                     auxiliary.forEach { (pid, started) -> teardown(pid, started) }
                     if (prootPid > 1) teardown(prootPid)
                     killGuestLeftovers()
                     finishSessionStop(status, stoppedGen)
                 }, "session-teardown").start()
             } else {
-                finishSessionStop(status, stoppedGen)
+                Thread({ com.droiddeck.launcher.stores.gog.GogComet.end(stoppedSession); finishSessionStop(status, stoppedGen) }, "gog-session-stop").start()
             }
         }
         if (prootPid > 1) acquireLocks()
@@ -1691,9 +1699,10 @@ class SessionService : Service() {
         }
         manager?.createNotificationChannel(channel)
 
+        val activity = if (vr) com.droiddeck.launcher.xr.VrSessionActivity::class.java else SessionActivity::class.java
         val open = PendingIntent.getActivity(
             this, 0,
-            Intent(this, SessionActivity::class.java)
+            Intent(this, activity)
                 .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
             PendingIntent.FLAG_IMMUTABLE,
         )
@@ -1703,7 +1712,7 @@ class SessionService : Service() {
         )
         val resume = PendingIntent.getActivity(
             this, 2,
-            Intent(this, SessionActivity::class.java)
+            Intent(this, activity)
                 .setAction(ACTION_RESUME)
                 .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
             PendingIntent.FLAG_IMMUTABLE,
@@ -1850,6 +1859,9 @@ class SessionService : Service() {
 
         const val EXTRA_MODE = "mode"
         const val MODE_STEAM = "steam"
+        /** The Steam session in the headset (xr.VrSessionActivity): MODE_STEAM but for the guest's
+         *  command line (droiddeck-session vr) and the activity the notification opens. */
+        const val MODE_VR = "vr"
         const val MODE_DESKTOP = "lxqt"
         /** A program inside the runtime, fullscreen under gamescope (EXTRA_PROGRAM = its path). */
         const val MODE_RUN = "run"

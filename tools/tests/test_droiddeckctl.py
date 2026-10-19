@@ -168,6 +168,22 @@ class DroiddeckctlTest(FakeAdbTest):
         self.assertEqual(4, code)
         self.assertEqual("SESSION_ACTIVE", out["error"]["code"])
 
+    def test_start_vr_reuse_keeps_only_a_vr_session(self):
+        # A VR session reports itself as Steam; its folder, and so its id, is named for vr.
+        running = state(focused=769)
+        running["session"].update(mode="steam", id="2026-10-12-01-vr")
+        self.configure({"state": running})
+        code, out = self.run_ctl("start", "vr", "--reuse", "--wait")
+        self.assertEqual(0, code)
+        self.assertTrue(out["reused"])
+        code, out = self.run_ctl("start", "steam", "--reuse")
+        self.assertEqual("SESSION_ACTIVE", out["error"]["code"])
+        running["session"]["id"] = "2026-10-12-02-steam"
+        self.configure({"state": running})
+        code, out = self.run_ctl("start", "vr", "--reuse")
+        self.assertEqual(4, code)
+        self.assertEqual("SESSION_ACTIVE", out["error"]["code"])
+
     def test_wait_game_ignores_the_client(self):
         self.configure({"state": [state(focused=769), state(focused=752590, focusable=[752590])]})
         code, out = self.run_ctl("wait", "game", "--timeout", "5")

@@ -7,6 +7,7 @@ import android.util.Base64
 import android.util.Log
 import com.droiddeck.launcher.SessionActivity
 import com.droiddeck.launcher.session.SessionService
+import com.droiddeck.launcher.xr.VrSessionActivity
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -62,6 +63,7 @@ class AgentStartActivity : Activity() {
         val requestedMode = request.optString("mode")
         val sessionMode = when (requestedMode) {
             "steam" -> SessionService.MODE_STEAM
+            "vr" -> SessionService.MODE_VR
             "desktop" -> SessionService.MODE_DESKTOP
             "run" -> SessionService.MODE_RUN
             else -> {
@@ -82,7 +84,8 @@ class AgentStartActivity : Activity() {
             return
         }
 
-        val sessionIntent = Intent(this, SessionActivity::class.java).apply {
+        val activity = if (sessionMode == SessionService.MODE_VR) VrSessionActivity::class.java else SessionActivity::class.java
+        val sessionIntent = Intent(this, activity).apply {
             action = SessionService.ACTION_AGENT_START
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             putExtra(SessionService.EXTRA_MODE, sessionMode)
@@ -91,7 +94,7 @@ class AgentStartActivity : Activity() {
                 putExtra(SessionService.EXTRA_PROGRAM, program)
                 putExtra(SessionService.EXTRA_PROGRAM_ARGS, Array(args.length()) { index -> args.optString(index) })
             }
-            if (sessionMode == SessionService.MODE_STEAM) {
+            if (sessionMode == SessionService.MODE_STEAM || sessionMode == SessionService.MODE_VR) {
                 request.optString("steamUi").takeIf { it == "desktop" }?.let {
                     putExtra(SessionService.EXTRA_STEAM_UI, it)
                 }

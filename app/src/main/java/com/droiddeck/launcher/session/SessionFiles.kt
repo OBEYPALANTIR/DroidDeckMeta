@@ -136,11 +136,24 @@ object SessionFiles {
         val fexPreloads = listOf("x86_64", "i386").flatMap { arch ->
             listOf("libblsession.so", "libfakeinput.so", "libfaultreport.so").map { "$arch/$it" to "usr/local/lib/droiddeck-fex/$arch/$it" }
         } + listOf("libthunkaudit.so", "libvulkan-thunk.so").map { "x86_64/$it" to "usr/local/lib/droiddeck-fex/x86_64/$it" }
+        // The guest's OpenXR pieces (tools/questbridge): the Khronos loader, hello_xr, the bridge
+        // runtime the vr session points titles at, and xrizer for OpenVR titles.
+        val questbridge = listOf(
+            "usr/local/bin/droiddeck-hello-xr",
+            "usr/local/lib/droiddeck-xr/hello_xr",
+            "usr/local/lib/droiddeck-xr/libopenxr_loader.so.1",
+            "usr/local/lib/droiddeck-xr/libopenxr_questbridge.so",
+            "usr/local/lib/droiddeck-xr/questbridge.json",
+            "usr/local/share/licenses/openxr-sdk/LICENSE",
+            "usr/local/lib/xrizer/bin/linuxarm64/vrclient.so",
+            "usr/local/lib/xrizer/bin/version.txt",
+            "usr/local/share/licenses/xrizer/LICENSE",
+        ).map { it to it }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + fexPreloads).filter { (asset, _) ->
+        ) + mangoapp + listOf("comet", "GalaxyCommunication.exe", "update-permissions.exe", "LICENSE", "version").map { "usr/local/lib/droiddeck-comet/$it" to "usr/local/lib/droiddeck-comet/$it" } + msitools.map { it to it } + fexPreloads + questbridge).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

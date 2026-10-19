@@ -14,6 +14,11 @@ object CompositorHost {
     @Volatile
     private var started = false
     private var vsyncRunning = false
+    /** The driver folder the compositor was started with (null = the system Vulkan). */
+    private var driverPath: String? = null
+    /** The VR session started the compositor (its pinned driver): only that session may re-attach. */
+    @Volatile
+    private var vrOwned = false
 
     private val vsync = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
@@ -52,6 +57,7 @@ object CompositorHost {
             surface, xdgRuntimeDir, driverPath, libraryName, nativeLibDir,
         )
         attached = surface
+        this.driverPath = driverPath
         started = true
         resumeVsync()
         return true
@@ -148,4 +154,35 @@ object CompositorHost {
     }
 
     val isStarted: Boolean get() = started
+
+    /**
+     * Why the running compositor cannot serve a new session that wants [wantedDriverPath] (null: any
+     * driver), or null when it can. It has no stop - its thread, Wayland socket and adrenotools-loaded
+     * driver live as long as the process - so the caller's only remedy is a new process.
+     */
+    fun restartReason(wantedDriverPath: String?): String? = when {
+        !started -> null
+        WaylandCompositor.nativePresentDeviceFailed() -> "has no Vulkan device (vkCreateDevice failed or the device was lost)"
+        wantedDriverPath != null && wantedDriverPath != driverPath -> "runs on ${driverPath ?: "the system Vulkan"}, not $wantedDriverPath"
+        else -> null
+    }
+
+    /** The VR session started the compositor on this call: its later entries may re-attach to it. */
+    fun noteVrStarted() {
+        vrOwned = true
+    }
+
+    /**
+     * Why a VR session cannot use the running compositor, or null when it can. Conservative: the
+     * recorded driver path is the requested one, not proof of the loaded driver (an adrenotools
+     * failure silently falls back to the system Vulkan, and native exposes no actual-load signal),
+     * so any compositor an earlier session left behind is refused; only the VR session that started
+     * it, still running, may re-attach. The caller's only remedy is a cold app restart.
+     */
+    fun vrRestartReason(): String? = when {
+        !started -> null
+        SessionState.running && vrOwned -> null
+        WaylandCompositor.nativePresentDeviceFailed() -> "has no Vulkan device (vkCreateDevice failed or the device was lost)"
+        else -> "belongs to an earlier session, not this VR one"
+    }
 }
