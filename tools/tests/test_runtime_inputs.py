@@ -65,8 +65,8 @@ class RuntimeInputsTest(unittest.TestCase):
             runtime.verify(self.root)
 
     def test_missing_quest_driver_cannot_be_attested(self):
-        (self.root / 'app/build/prepared-assets/graphics_driver/adrenotools-turnip25.1.0-quest1.tzst').unlink()
-        with self.assertRaisesRegex(ValueError, 'quest1.tzst'):
+        (self.root / 'app/build/prepared-assets/graphics_driver/adrenotools-turnip-quest.tzst').unlink()
+        with self.assertRaisesRegex(ValueError, 'turnip-quest.tzst'):
             runtime.record(self.root)
 
     def test_modified_prebuilt_binary_is_rejected(self):

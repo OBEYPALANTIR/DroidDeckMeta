@@ -232,6 +232,14 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCompositorTid(JNIEnv
     return (jint)g_comp_tid;
 }
 
+/* The present device failed to come up or was lost (vkp_device_failed): nothing will be drawn again in
+ * this process, so the app must start a new one. Any thread. */
+JNIEXPORT jboolean JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativePresentDeviceFailed(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    return vkp_device_failed() ? JNI_TRUE : JNI_FALSE;
+}
+
 /* Headless start (no output window) - used for bring-up tests. */
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeStart(JNIEnv *env, jclass clazz,

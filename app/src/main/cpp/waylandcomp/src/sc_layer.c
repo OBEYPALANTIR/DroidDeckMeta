@@ -365,14 +365,18 @@ static void drain_and_free_pools(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
-/* Native-handle sniff, the same one Mesa's u_gralloc fallback uses (u_gralloc_fallback.c): a QTI
- * gralloc private_handle_t carries the magic 'gmsm' as its first int and the UBWC flag
- * (PRIV_FLAGS_UBWC_ALIGNED, 0x08000000) in the next one. Returns 0 when the layout is unknown. */
+/* Native-handle sniff sharing the layout recognition of Mesa's u_gralloc fallback (u_gralloc_fallback.c
+ * plus the tools/quest/mesa-patches fix): a QTI gralloc private_handle_t carries the magic 'gmsm' as its
+ * first int and the UBWC flag (PRIV_FLAGS_UBWC_ALIGNED, 0x08000000) in the next one; Meta Quest's gralloc
+ * (libgralloccore, 2 fds / 27 ints) puts one int before the magic. Unlike the driver, a handle without
+ * the magic is unknown here (returns 0): the pool then stays linear by request rather than guessing. */
 static int sniff_modifier(const struct droiddeck_native_handle *h, uint64_t *mod) {
     const uint32_t gmsm = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
     if (!h || h->numFds < 1 || h->numInts < 2) return 0;
-    if ((uint32_t)h->data[h->numFds] != gmsm) return 0;
-    *mod = (h->data[h->numFds + 1] & 0x08000000) ? MOD_QCOM_COMPRESSED : MOD_LINEAR;
+    const int *ints = h->data + h->numFds;
+    int flags_at = (uint32_t)ints[0] == gmsm ? 1 : (h->numInts >= 3 && (uint32_t)ints[1] == gmsm) ? 2 : 0;
+    if (!flags_at) return 0;
+    *mod = (ints[flags_at] & 0x08000000) ? MOD_QCOM_COMPRESSED : MOD_LINEAR;
     return 1;
 }
 
@@ -503,8 +507,9 @@ static int take_free_slot(struct layer *l, int w, int h, uint32_t fmt, int *wait
         struct pollfd p = {.fd = fd, .events = POLLIN};
         int r;
         do { r = poll(&p, 1, 100); } while (r < 0 && errno == EINTR);
-        if (r == 0) {
-            /* Still read by the display: keep its fence with it (the next use waits again), drop this frame. */
+        if (r <= 0) {
+            /* Still read by the display, or the poll failed: keep its fence with it (the next use waits
+             * again), drop this frame. */
             pthread_mutex_lock(&g_lock);
             if (s->release_fd < 0) s->release_fd = fd; else close(fd);
             pthread_mutex_unlock(&g_lock);
@@ -519,6 +524,16 @@ static int take_free_slot(struct layer *l, int w, int h, uint32_t fmt, int *wait
     }
     *wait_fd = fd;
     return idx;
+}
+
+/* Fence lost (the blit wait timed out or failed): the display may still be reading this slot, and
+ * nothing can prove otherwise now, so it is never reused. Rare; the pool shrinks by one. */
+static void quarantine_slot(struct layer *l, int idx) {
+    pthread_mutex_lock(&g_lock);
+    l->slots[idx].busy = 1;
+    pthread_mutex_unlock(&g_lock);
+    droiddeck_log("error", "layer: %s: buffer %d quarantined (its release fence was lost); pool has %d buffers",
+               l->name, idx, l->pool_n);
 }
 
 /* ---- public --------------------------------------------------------------------------------- */
@@ -887,7 +902,9 @@ int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const stru
     int wait_fd;
     int idx = take_free_slot(l, sw, sh, AHB_RGBA8, &wait_fd);
     if (idx < 0) { log_drop(l); return 0; }
-    if (vkp_blit_image(src, l->slots[idx].img, wait_fd) != 0) return -1;
+    int br = vkp_blit_image(src, l->slots[idx].img, wait_fd);
+    if (br == -2) quarantine_slot(l, idx);
+    if (br != 0) return -1;
     if (present_slot(l, idx, r, color, 0) != 0) return -1;
     if (color && color->dataspace) droiddeck_color_frame_shown(color, DROIDDECK_HDR_LAYER_COPY, AHB_RGBA8);
     if (!l->first_logged) {
@@ -912,7 +929,9 @@ int sc_layer_present_pass(const struct vkp_draw *draws, int n, int scene_w, int 
     int wait_fd;
     int idx = take_free_slot(l, rw, rh, AHB_RGBA8, &wait_fd);
     if (idx < 0) { vkp_pass_abort(); log_drop(l); return 0; }
-    if (vkp_pass_copy_to(l->slots[idx].img, wait_fd) != 0) return -1;
+    int cr = vkp_pass_copy_to(l->slots[idx].img, wait_fd);
+    if (cr == -2) quarantine_slot(l, idx);
+    if (cr != 0) return -1;
     if (present_slot(l, idx, r, NULL, 0) != 0) return -1; /* the effects chain's result is 8-bit sRGB */
     if (!l->first_logged) {
         l->first_logged = 1;
@@ -954,7 +973,9 @@ int sc_layer_present_hdr_scene(const struct vkp_draw *draws, int n, const struct
         idx = take_free_slot(l, rw, rh, g_hdr_pool_fmt, &wait_fd);
     }
     if (idx < 0) { vkp_pass_abort(); log_drop(l); return 0; }
-    if (vkp_pass_copy_to(l->slots[idx].img, wait_fd) != 0) return -1;
+    int cr = vkp_pass_copy_to(l->slots[idx].img, wait_fd);
+    if (cr == -2) quarantine_slot(l, idx);
+    if (cr != 0) return -1;
     if (present_slot(l, idx, r, tm ? NULL : color, 0) != 0) return -1; /* tone-mapped = plain sRGB: no tag */
     if (color && color->dataspace)
         droiddeck_color_frame_shown(color, tm ? DROIDDECK_HDR_TONEMAPPED : DROIDDECK_HDR_COMPOSED, tm ? AHB_RGBA8 : g_hdr_pool_fmt);
@@ -1051,7 +1072,9 @@ int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int transl
     if (idx < 0) { log_drop(l); return 0; }
     /* The window is copied into the layer buffer 1:1; `geo` crops it and places it, so the layer
      * is exactly the window's rectangle on screen and nothing else is blended anywhere. */
-    if (vkp_blit_image(src, l->slots[idx].img, wait_fd) != 0) return -1;
+    int br = vkp_blit_image(src, l->slots[idx].img, wait_fd);
+    if (br == -2) { quarantine_slot(l, idx); return -1; }
+    if (br != 0) return -1;
     if (present_slot(l, idx, geo, NULL, translucent) != 0) return -1;
     if (!l->first_logged) {
         l->first_logged = 1;

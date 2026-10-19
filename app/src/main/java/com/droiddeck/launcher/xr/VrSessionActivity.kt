@@ -12,6 +12,7 @@ import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.FileUtils
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.runtime.LinuxRuntimeInstaller
+import com.droiddeck.launcher.session.QuestExperimental
 import com.droiddeck.launcher.session.SessionEvents
 import com.droiddeck.launcher.session.SessionPaths
 import com.droiddeck.launcher.session.SessionPhase
@@ -86,6 +87,24 @@ class VrSessionActivity : Activity() {
             finish()
             return
         }
+        // The compositor is process-wide and has no stop: one an earlier session left behind cannot
+        // serve this one, and there is no verified way to replace it from here. Refuse the session
+        // with the concrete reason (logged, no guest started, no READY) and finish: a cold app
+        // restart is the only remedy. Checked before the bridge, so no OpenXR session is made just
+        // to be killed. Refusing never stops a prior guest: this activity simply finishes.
+        // The panel is an SDR swapchain, so a compositor whose HDR gate already stands open (a 2D
+        // HDR session's) is refused even when that session is still running: native SDR cannot
+        // retcon an open gate.
+        if (WaylandCompositor.nativeHdrGateState() == 1) {
+            Log.w(TAG, "vr: the compositor already runs with its HDR gate open; cold-restart the app and try again")
+            unavailable("the compositor already runs with its HDR gate open; cold-restart the app and try again")
+            return
+        }
+        CompositorHost.vrRestartReason()?.let { why ->
+            Log.w(TAG, "vr: the compositor $why; cold-restart the app and try again")
+            unavailable("the compositor $why; cold-restart the app and try again")
+            return
+        }
         WaylandCompositor.setFirstFrameListener(firstFrame)
         SessionState.endListener = endListener
         bridgeStarted = true
@@ -157,6 +176,10 @@ class VrSessionActivity : Activity() {
             SessionState.followScreen = false
             SessionState.refreshHz = PANEL_HZ
             SessionState.fpsLimit = SessionPrefs.fpsLimit(this, SessionService.MODE_STEAM)
+            // The panel is an XR Android surface swapchain, not a display layer: SDR, whatever a
+            // previous 2D session negotiated (begin() leaves hdr alone, and the guest reads it for
+            // BL_HDR/DXVK_HDR).
+            SessionState.hdr = false
         }
         val runtimeDir = File(filesDir, ".wayland-rt").apply { mkdirs() }
         // The compositor hands this keymap to wl_keyboard clients, which is how the guest reads the
@@ -164,7 +187,31 @@ class VrSessionActivity : Activity() {
         FileUtils.copyAsset(this, "wayland/keymap.xkb", File(runtimeDir, "keymap.xkb"))
         // Turnip, not the system driver: importing gamescope's dma-bufs needs VK_EXT_image_drm_format_modifier.
         val turnip = TurnipDriver(this)
-        val driverId = if (CompositorHost.isStarted) null else turnip.install()
+        val pinned = pinnedDriver
+        val driverId = when {
+            CompositorHost.isStarted -> null
+            pinned != null -> {
+                Log.i(TAG, "vr: driver $pinned (pinned for Quest)")
+                turnip.install(pinned)
+            }
+            else -> turnip.install()
+        }
+        if (!CompositorHost.isStarted && pinned != null && driverId == null) {
+            // The pinned driver did not unpack: a null driverId below would silently mean the system
+            // Vulkan, which cannot import the game's dma-bufs. Refuse before the compositor and guest.
+            unavailable("the headset's pinned driver $pinned could not be installed")
+            return
+        }
+        if (!CompositorHost.isStarted) {
+            // The compositor's HDR gate is decided once, before it starts: keep it shut. A previous 2D
+            // HDR session leaves DROIDDECK_WAYLAND_HDR=1 in this process (SessionActivity never unsets
+            // it), so clear it or this session would inherit the open gate.
+            runCatching { android.system.Os.unsetenv("DROIDDECK_WAYLAND_HDR") }
+                .onFailure { Log.w(TAG, "DROIDDECK_WAYLAND_HDR", it) }
+            WaylandCompositor.nativeSetHdrRequest(
+                WaylandCompositor.HDR_MODE_OFF, "vr session: the panel is an XR surface swapchain (SDR)", false, false,
+            )
+        }
         if (starting) {
             // The compositor opens its log once, when it starts, and the session's folder is claimed now.
             val waylandLog = File(SessionPaths.beginOrCurrent(this), "wayland.log")
@@ -181,11 +228,12 @@ class VrSessionActivity : Activity() {
         SessionEvents.markReadyIfPossible()
         // A zero-copy game goes onto an Android layer of its own, which the headset never shows.
         WaylandCompositor.nativeSetZeroCopy(false)
-        CompositorHost.startOrAttach(
+        val startedHere = CompositorHost.startOrAttach(
             surface, runtimeDir.path,
             driverId?.let { turnip.driverPath(it) }, driverId?.let { turnip.libraryName(it) },
             applicationInfo.nativeLibraryDir, PANEL_WIDTH, PANEL_HEIGHT, SessionState.refreshHz, SessionState.fpsLimit,
         )
+        if (startedHere) CompositorHost.noteVrStarted()
         if (starting) {
             SessionEvents.record("compositor.started")
             SessionEvents.transition(SessionPhase.STARTING_GUEST, "guest.starting")
@@ -203,6 +251,10 @@ class VrSessionActivity : Activity() {
         Toast.makeText(this, R.string.xr_bridge_unavailable, Toast.LENGTH_LONG).show()
         finish()
     }
+
+    /** The headset's driver, whatever Setup says (null off Quest: the user's choice, as in SessionActivity). */
+    private val pinnedDriver: String?
+        get() = if (QuestExperimental.isSupported()) QuestExperimental.DRIVER else null
 
     companion object {
         private const val TAG = "VrSessionActivity"

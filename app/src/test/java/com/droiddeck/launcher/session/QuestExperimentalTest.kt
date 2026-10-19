@@ -52,6 +52,17 @@ class QuestExperimentalTest {
         assertFalse(SessionPrefs.hdr(context, "steam"))
     }
 
+    @Test fun theFirstQuestAdapterIdMigratesToTheCurrentDriverButOtherChoicesStay() {
+        ShadowBuild.setModel("Quest 3")
+        QuestExperimental.initialize(context)
+        SessionPrefs.setAndroidDriver(context, "turnip25.1.0-quest1")
+        QuestExperimental.initialize(context)
+        assertEquals(QuestExperimental.DRIVER, SessionPrefs.androidDriver(context))
+        SessionPrefs.setAndroidDriver(context, "")
+        QuestExperimental.initialize(context)
+        assertEquals("", SessionPrefs.androidDriver(context))
+    }
+
     @Test fun quest3sIsRecognizedByModelOrDevice() {
         assertTrue(QuestExperimental.supported("Quest 3S", "unknown", "Oculus"))
         assertTrue(QuestExperimental.supported("unknown", "panther", "Oculus"))

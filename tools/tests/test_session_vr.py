@@ -40,18 +40,33 @@ class SessionVrTest(unittest.TestCase):
                   dict({"PATH": os.environ["PATH"], "HOME": str(self.home)}, **env))
         return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
+    def exported_twice(self, **env):
+        """Environment after two calls: the loader path must not duplicate."""
+        out = run(vr_function(self.xrizer) + "vr_environment >/dev/null\nvr_environment >/dev/null\nenv\n",
+                  dict({"PATH": os.environ["PATH"], "HOME": str(self.home)}, **env))
+        return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
     def test_vr_is_taken_as_the_steam_session_and_carried_through_gamescope(self):
         line = next(l for l in SESSION.read_text().splitlines() if l.startswith('if [ "$mode" = vr ]'))
         out = run('mode=vr\n%s\necho "$mode"\nprintenv BL_VR\n' % line, {"PATH": os.environ["PATH"]})
         self.assertEqual(["steam", "1"], out.splitlines())
 
-    def test_the_bridge_is_set_where_the_client_environment_is_built(self):
-        # Before the client's own libraries are put first, which Proton's launcher strips again.
-        source = SESSION.read_text()
-        steam = source.index("\n  steam)\n")
-        call = source.index('[ "${BL_VR:-}" = 1 ] && vr_environment', steam)
-        client = source.index("export LD_LIBRARY_PATH=$steam_root/steamrtarm64", steam)
-        self.assertLess(call, client)
+    def test_preselected_manifest_still_sets_socket_loader_and_xrizer(self):
+        # A caller-supplied XR_RUNTIME_JSON alone must not skip the rest of the setup.
+        self.xrizer.mkdir()
+        env = self.exported(XR_RUNTIME_JSON="/usr/local/lib/droiddeck-xr/questbridge.json",
+                            DROIDDECK_BWRAP_SOCKET="com.droiddeck.quest.bwrap")
+        self.assertEqual("@com.droiddeck.quest.xr-bridge", env["DROIDDECK_XR_SOCKET"])
+        self.assertEqual("/usr/local/lib/droiddeck-xr", env["LD_LIBRARY_PATH"])
+        self.assertEqual({"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"},
+                         json.loads(self.vrpath.read_text()))
+
+    def test_repeated_invocation_does_not_duplicate_the_loader_path(self):
+        env = self.exported_twice(DROIDDECK_BWRAP_SOCKET="com.droiddeck.quest.bwrap",
+                                  LD_LIBRARY_PATH="/usr/lib/extra")
+        self.assertEqual("/usr/local/lib/droiddeck-xr:/usr/lib/extra", env["LD_LIBRARY_PATH"])
+        self.assertEqual("@com.droiddeck.quest.xr-bridge", env["DROIDDECK_XR_SOCKET"])
+
 
     def test_the_client_gets_the_runtime_the_socket_and_the_loader(self):
         env = self.exported(DROIDDECK_BWRAP_SOCKET="com.droiddeck.quest.bwrap", LD_LIBRARY_PATH="/usr/lib/extra")
@@ -72,12 +87,18 @@ class SessionVrTest(unittest.TestCase):
         self.assertEqual({"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"},
                          json.loads(self.vrpath.read_text()))
 
-    def test_dxvk_skips_the_openvr_extension_query_under_xrizer_unless_the_user_says_otherwise(self):
-        # xrizer answers that query with win32 extensions no Linux driver has; DXVK then fails
-        # vkCreateDevice. Without xrizer nothing asks DXVK anything.
+    def test_without_xrizer_an_existing_vrpath_is_left_alone(self):
+        # No destructive cleanup: without xrizer a user's own registry stays as it was.
+        self.vrpath.parent.mkdir(parents=True)
+        self.vrpath.write_text('{"runtime": ["/user/own"], "version": 1, "jsonid": "vrpathreg"}')
         self.assertNotIn("DXVK_NO_VR", self.exported())
+        self.assertEqual('{"runtime": ["/user/own"], "version": 1, "jsonid": "vrpathreg"}',
+                         self.vrpath.read_text())
+
+    def test_vr_setup_preserves_explicit_dxvk_diagnostics_without_enabling_them(self):
         self.xrizer.mkdir()
-        self.assertEqual("1", self.exported()["DXVK_NO_VR"])
+        self.assertNotIn("DXVK_NO_VR", self.exported())
+        self.assertEqual("1", self.exported(DXVK_NO_VR="1")["DXVK_NO_VR"])
         self.assertEqual("0", self.exported(DXVK_NO_VR="0")["DXVK_NO_VR"])
 
 

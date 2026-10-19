@@ -270,7 +270,8 @@ static XrResult locate(const struct qb_space_handle *sp, const struct qb_space_h
         *vf = loc.velocity_flags;
         if (loc.velocity_flags && linear && angular)
             qb_velocity_compose(base->offset, sp->offset, (XrQuaternionf){loc.pose.qx, loc.pose.qy, loc.pose.qz, loc.pose.qw},
-                                loc.velocity_flags, (XrVector3f){loc.linear[0], loc.linear[1], loc.linear[2]},
+                                loc.location_flags, loc.velocity_flags,
+                                (XrVector3f){loc.linear[0], loc.linear[1], loc.linear[2]},
                                 (XrVector3f){loc.angular[0], loc.angular[1], loc.angular[2]}, vf, linear, angular);
     }
     return XR_SUCCESS;
@@ -504,8 +505,12 @@ XrResult qb_xrEndFrame(XrSession session, const XrFrameEndInfo *info) {
     }
     ef.display_time = info->displayTime;
     ef.environment_blend_mode = (uint32_t)info->environmentBlendMode;
-    /* the service reads the images once this signals; -1: qb_vulkan already waited for the GPU */
-    int fence = ef.layer_count ? qb_vk_end_frame_fence(s->vk) : -1;
+    /* the service reads the images once this signals; -1 after a successful CPU wait (nothing to send) */
+    int fence = -1;
+    if (ef.layer_count) {
+        XrResult fr = qb_vk_end_frame_fence(s->vk, &fence);
+        if (XR_FAILED(fr)) return fr; /* nothing readable was sent; the frame stays begun for a retry */
+    }
     struct qb_status st;
     XrResult r = qb_ipc_call(&inst->ipc, QB_OP_END_FRAME, &ef, sizeof(ef), &fence, fence >= 0 ? 1 : 0, &st, sizeof(st),
                              NULL, 0, NULL);

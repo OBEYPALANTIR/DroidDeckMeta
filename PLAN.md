@@ -82,7 +82,7 @@ Components, smallest first:
   "kernel": "5.10.246",
   "gpu": {"chip_id": "0x43050b00", "kgsl_name": "Adreno740v3"},
   "droiddeck": {"commit": "<sha>", "variant": "standard | quest", "package": "com.droiddeck.quest"},
-  "runtime": {"turnip_android": "turnip25.1.0-quest1", "turnip_linux": "<tag>", "gamescope": "3.16.29-p9", "proton": "<tag>", "fex": "<tag>"},
+  "runtime": {"turnip_android": "turnip-quest", "turnip_linux": "<tag>", "gamescope": "3.16.29-p9", "proton": "<tag>", "fex": "<tag>"},
   "vr": {"meta_runtime_version": "", "bridge_commit": "", "xrizer_commit": ""},
   "evidence": ["ids from the ledger"]
 }

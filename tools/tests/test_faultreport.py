@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,8 +31,21 @@ class FaultReportTest(unittest.TestCase):
         library, program = self.build(bits)
         result = subprocess.run([str(program)], env=dict(os.environ, LD_PRELOAD=str(library)), capture_output=True, text=True)
         self.assertEqual(result.returncode, -4)
-        self.assertRegex(result.stderr, r"droiddeck-fex: SIGILL at 0x[0-9a-f]+ \(si_code 02\), offset 0x[0-9a-f]+, bytes 0f 0b ")
-        self.assertIn("program%s" % bits, result.stderr)
+        # si_code varies by execution platform; the fault and its location must not.
+        fault = re.search(r"droiddeck-fex: SIGILL at 0x([0-9a-f]+) ", result.stderr)
+        instruction = re.search(r", offset 0x([0-9a-f]+), bytes 0f 0b ", result.stderr)
+        mapping = re.search(
+            r"\n  in ([0-9a-f]+)-([0-9a-f]+) [r-][w-][x-][ps] "
+            r"[0-9a-f]+ [0-9a-f]+:[0-9a-f]+ [0-9]+ +" + re.escape(str(program)) + r"\n",
+            result.stderr)
+        self.assertIsNotNone(fault, result.stderr)
+        self.assertIsNotNone(instruction, result.stderr)
+        self.assertIsNotNone(mapping, result.stderr)
+        address = int(fault.group(1), 16)
+        start, end = (int(value, 16) for value in mapping.groups())
+        self.assertGreaterEqual(address, start)
+        self.assertLess(address, end)
+        self.assertEqual(int(instruction.group(1), 16), address - start)
 
     def test_an_x86_64_program_reports_its_illegal_instruction(self):
         self.check("64")

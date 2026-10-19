@@ -205,6 +205,10 @@ XrResult qb_xrAcquireSwapchainImage(XrSwapchain swapchain, const XrSwapchainImag
         if (reply.index >= sc->image_count) return XR_ERROR_RUNTIME_FAILURE;
         i = reply.index;
     }
+    /* direct images enter the app layout here, ahead of the app's rendering by queue order; a failure
+     * hands nothing out (the service re-offers a remote image once its round-robin returns to it) */
+    XrResult vr = qb_vk_swapchain_acquire(s->vk, sc->vk, i);
+    if (XR_FAILED(vr)) return vr;
     sc->acquired[(sc->acquired_head + sc->acquired_count++) % QB_MAX_SWAPCHAIN_IMAGES] = i;
     sc->ever_acquired = 1;
     *index = i;
@@ -229,11 +233,12 @@ XrResult qb_xrReleaseSwapchainImage(XrSwapchain swapchain, const XrSwapchainImag
     QB_LOCK(s->inst);
     if (!sc->waited) return XR_ERROR_CALL_ORDER_INVALID;
     uint32_t i = sc->acquired[sc->acquired_head];
+    XrResult r = qb_vk_swapchain_release(s->vk, sc->vk, i);
+    if (XR_FAILED(r)) return r;
+    /* pop only after the handoff submitted: a failed release stays acquired for a retry */
     sc->acquired_head = (sc->acquired_head + 1) % QB_MAX_SWAPCHAIN_IMAGES;
     sc->acquired_count--;
     sc->waited = 0;
-    XrResult r = qb_vk_swapchain_release(s->vk, sc->vk, i);
-    if (XR_FAILED(r)) return r;
     sc->released = i;
     return qb_session_result(s, XR_SUCCESS);
 }

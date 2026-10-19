@@ -70,20 +70,23 @@ static inline struct qb_posef qb_pose_to_wire(XrPosef p) {
 /* Velocity of guest space (wire * sp_offset) in guest space (wire base * base_offset), from the wire
  * velocity of the wire space's origin. The offsets are rigid and fixed, so: the angular velocity is the
  * wire one; the linear velocity is the wire origin's plus the arc the offset point sweeps,
- * w x (R_wire * sp_offset.position), which needs a valid angular velocity when that offset is not
- * zero (without it the linear velocity is unknown and its flag is cleared). Both are then expressed in
- * the base guest space by the inverse of the base offset's rotation (a static offset adds no velocity). */
+ * w x (R_wire * sp_offset.position), which needs a valid angular velocity and a valid wire orientation
+ * when that offset is not zero (without either the linear velocity is unknown and its flag is cleared;
+ * tracked state is irrelevant, and a zero offset needs no orientation). Both are then expressed in
+ * the base guest space by the inverse of the base offset's rotation (a static offset adds no velocity).
+ * Angular validity is independent: clearing linear never clears angular. */
 static inline void qb_velocity_compose(XrPosef base_offset, XrPosef sp_offset, XrQuaternionf wire_orientation,
-                                       XrSpaceVelocityFlags wire_flags, XrVector3f wire_linear,
-                                       XrVector3f wire_angular, XrSpaceVelocityFlags *flags, XrVector3f *linear,
-                                       XrVector3f *angular) {
+                                       XrSpaceLocationFlags loc_flags, XrSpaceVelocityFlags wire_flags,
+                                       XrVector3f wire_linear, XrVector3f wire_angular, XrSpaceVelocityFlags *flags,
+                                       XrVector3f *linear, XrVector3f *angular) {
     *flags = wire_flags;
     *linear = (XrVector3f){0.0f, 0.0f, 0.0f};
     *angular = (XrVector3f){0.0f, 0.0f, 0.0f};
     XrVector3f lin = wire_linear;
     int offset = sp_offset.position.x != 0.0f || sp_offset.position.y != 0.0f || sp_offset.position.z != 0.0f;
     if ((wire_flags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) && offset) {
-        if (wire_flags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+        if ((wire_flags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) &&
+            (loc_flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
             XrVector3f arc = qb_vec3_cross(wire_angular, qb_quat_rotate(wire_orientation, sp_offset.position));
             lin = (XrVector3f){lin.x + arc.x, lin.y + arc.y, lin.z + arc.z};
         } else {

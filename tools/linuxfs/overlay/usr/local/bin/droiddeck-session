@@ -221,25 +221,23 @@ program_cores() {
 # app's service on the abstract socket named for the app's package as the bwrap one is
 # (BwrapSpawner); OpenVR titles find xrizer through the path registry.
 vr_environment() {
-  # Once per process tree: the agent, the client and this script's inner pass all inherit it.
-  [ "${XR_RUNTIME_JSON:-}" = /usr/local/lib/droiddeck-xr/questbridge.json ] && return 0
   local xr=/usr/local/lib/droiddeck-xr bwrap=${DROIDDECK_BWRAP_SOCKET:-com.droiddeck.launcher.bwrap}
   local vrpath=${XDG_CONFIG_HOME:-$HOME/.config}/openvr/openvrpaths.vrpath
   export XR_RUNTIME_JSON=$xr/questbridge.json
   export DROIDDECK_XR_SOCKET=@${bwrap%.bwrap}.xr-bridge
-  export LD_LIBRARY_PATH=$xr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":$xr:"*) ;;
+    *) export LD_LIBRARY_PATH=$xr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ;;
+  esac
   echo "== vr: OpenXR runtime $XR_RUNTIME_JSON, service $DROIDDECK_XR_SOCKET"
   [ -f "$XR_RUNTIME_JSON" ] || echo "== vr: this runtime has no $XR_RUNTIME_JSON; OpenXR titles will find no runtime"
   if [ -d /usr/local/lib/xrizer ]; then
     mkdir -p "${vrpath%/*}"
     printf '%s\n' '{"runtime": ["/usr/local/lib/xrizer"], "version": 1, "jsonid": "vrpathreg"}' > "$vrpath"
     echo "== vr: OpenVR titles go through xrizer ($vrpath)"
-    # DXVK asks the OpenVR compositor which Vulkan device extensions it needs and enables them blindly;
-    # xrizer answers with the win32 external-memory trio, which no Linux driver has, and
-    # vkCreateDevice fails (DroidDeckMeta loop3-dxvk-bisect). Its presentation does not go through
-    # DXVK anyway. The user's own value, if set, wins.
-    export DXVK_NO_VR=${DXVK_NO_VR:-1}
   fi
+  # Without xrizer an existing vrpath is the user's own and is left alone: this
+  # function only writes the registry, never removes it.
 }
 
 if [ -z "${BL_INSIDE:-}" ]; then

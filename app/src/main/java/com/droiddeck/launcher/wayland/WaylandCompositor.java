@@ -235,6 +235,10 @@ public final class WaylandCompositor {
     /** The compositor thread's Linux tid, or 0 before it has started. */
     public static native int nativeCompositorTid();
 
+    /** True once the compositor's Vulkan device could not be created or was lost: it presents nothing
+     *  for the rest of this process. False before the device has been tried. Any thread. */
+    public static native boolean nativePresentDeviceFailed();
+
     /** Shortcut launches: don't draw explorer's windows (desktop, taskbar, Start menu), matching the
      *  X11 renderer's unviewable "explorer.exe". Set before the compositor starts. */
     public static native void nativeSetHideShell(boolean hide);

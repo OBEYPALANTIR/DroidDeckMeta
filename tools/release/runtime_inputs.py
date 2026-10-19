@@ -17,8 +17,7 @@ SOURCE_PATHS = ['app/build.gradle', 'app/src/main/cpp/fakeinput_steam.cpp', 'app
                 'tools/gamescope/release.env', 'tools/droiddeck-esync/release.env',
                 'tools/mangoapp', 'tools/msitools', 'tools/comet', 'tools/build_local.sh',
                 'tools/release/runtime_inputs.py', 'app/src/main/assets/desktop-removal',
-                'tools/quest', 'tools/questbridge', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h',
-                'app/src/main/assets/graphics_driver/adrenotools-turnip25.1.0.tzst']
+                'tools/quest', 'tools/questbridge', 'app/src/main/cpp/adrenotools/src/hook/kgsl.h']
 
 
 def digest(path):
@@ -50,13 +49,13 @@ def outputs(root):
     for library in ['libproot.so', 'libproot-loader.so', 'libdirectaudiorelay.so']:
         result['lib/arm64-v8a/' + library] = 'app/src/main/jniLibs/arm64-v8a/' + library
     result['assets/pulseaudio.tzst'] = 'app/build/prepared-assets/pulseaudio.tzst'
-    result['assets/graphics_driver/adrenotools-turnip25.1.0-quest1.tzst'] = \
-        'app/build/prepared-assets/graphics_driver/adrenotools-turnip25.1.0-quest1.tzst'
+    result['assets/graphics_driver/adrenotools-turnip-quest.tzst'] = \
+        'app/build/prepared-assets/graphics_driver/adrenotools-turnip-quest.tzst'
     return result
 
 
 def required():
-    paths = ['assets/graphics_driver/adrenotools-turnip25.1.0-quest1.tzst']
+    paths = ['assets/graphics_driver/adrenotools-turnip-quest.tzst']
     paths += ['assets/linuxfs/' + name for name in ['libfakeinput.so', 'libblsession.so',
              'libblfastpath.so', 'libssbs.so', 'usr/local/bin/droiddeck-clipboard',
              'usr/local/bin/gamescope', 'usr/local/lib/droiddeck/uruntime']]

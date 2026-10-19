@@ -4,9 +4,9 @@
  * The core (qb_runtime.c, qb_session.c, qb_swapchain.c, qb_input.c) owns every OpenXR handle and the
  * socket; this module owns everything that touches the app's Vulkan device: XR_KHR_vulkan_enable and
  * XR_KHR_vulkan_enable2, importing the service's gralloc dma-bufs as VkImages, the guest-owned images
- * an app gets when the imported ones cannot be handed over directly (array layers, multisampling, a
- * format the service does not allocate, depth), the blit/resolve into the imported image on release,
- * and the sync_file fence that tells the service the frame is rendered.
+ * format the service does not allocate, depth), the blit/resolve into the imported image on release
+ * (or the direct image's ownership handoff), and the sync_file fence that tells the service the frame
+ * is rendered.
  *
  * Every function is called from the app's thread with the core's session lock held; nothing here
  * blocks on the socket.
@@ -77,7 +77,9 @@ void qb_vk_unbind(struct qb_vk *vk);
  * TRANSFER_SRC | TRANSFER_DST | COLOR_ATTACHMENT | SAMPLED. When vkCreateImage refuses the modifier
  * (XR_ERROR_RUNTIME_FAILURE is NOT returned): fall back to the guest-owned path with a linear
  * imported image only if info->modifier is linear; a refused UBWC import is a hard failure
- * (XR_ERROR_RUNTIME_FAILURE) because the service's buffer cannot be read any other way. */
+ * (XR_ERROR_RUNTIME_FAILURE) because the service's buffer cannot be read any other way. The service
+ * handoff crosses VK_EXT_queue_family_foreign, so a device without it cannot back a service
+ * swapchain at all (XR_ERROR_FEATURE_UNSUPPORTED); there is no IGNORED fallback. */
 XrResult qb_vk_swapchain_import(struct qb_vk *vk, const XrSwapchainCreateInfo *ci,
                                 const struct qb_swapchain_info *info, const int *fds, uint32_t fd_count,
                                 struct qb_vk_swapchain **out);
@@ -92,9 +94,17 @@ uint32_t qb_vk_swapchain_image_count(const struct qb_vk_swapchain *sc);
 VkImage qb_vk_swapchain_app_image(const struct qb_vk_swapchain *sc, uint32_t index);
 /* 1 when the app image differs from the imported one (a blit/resolve happens on release). */
 int qb_vk_swapchain_is_indirect(const struct qb_vk_swapchain *sc);
-/* xrReleaseSwapchainImage: when indirect, record and submit the blit/resolve from the app image into
- * imported image `index` on the bound queue (the app's work is already queued, so queue order covers
- * it). Direct swapchains: nothing to do. The core sends the frame's fence afterwards. */
+/* xrAcquireSwapchainImage, once the core picked `index`: when direct, submit the handoff that leaves
+ * imported image `index` in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL for the app (from UNDEFINED on
+ * first acquire, from GENERAL/FOREIGN once the service has had it) on the bound queue, so queue order
+ * puts it ahead of the app's rendering. Indirect and local swapchains: nothing to do (the app image
+ * is guest-owned). XR_ERROR_CALL_ORDER_INVALID when the image is already with the app. */
+XrResult qb_vk_swapchain_acquire(struct qb_vk *vk, struct qb_vk_swapchain *sc, uint32_t index);
+/* xrReleaseSwapchainImage: when indirect, submit the blit/resolve from the app image into imported
+ * image `index`; when direct, submit the transition of imported image `index` back to GENERAL/FOREIGN
+ * for the service. Both run on the bound queue (the app's work is already queued, so queue order
+ * covers it). Local swapchains: nothing to do. The core sends the frame's fence afterwards.
+ * XR_ERROR_CALL_ORDER_INVALID when a direct image was not acquired. */
 XrResult qb_vk_swapchain_release(struct qb_vk *vk, struct qb_vk_swapchain *sc, uint32_t index);
 /* The formats this module can give the app directly or indirectly, appended to the service's list by
  * the core: the depth formats (D32_SFLOAT, D24_UNORM_S8_UINT, D16_UNORM, D32_SFLOAT_S8_UINT) and the
@@ -106,9 +116,11 @@ int qb_vk_format_is_local(int64_t format);
 /* ---- frame completion */
 
 /* Called from xrEndFrame before the END_FRAME request: submits an empty batch after everything the app
- * (and this module's blits) queued, signalling a fence exportable as a sync_file. Returns the sync_file
- * fd (the caller sends and closes it). When the device cannot export sync files, waits the fence on
- * the CPU and returns -1: the service may then read the images at once. */
-int qb_vk_end_frame_fence(struct qb_vk *vk);
+ * (and this module's transitions/blits) queued, signalling a fence exportable as a sync_file. On
+ * XR_SUCCESS writes the sync_file fd to `*fd` (the caller sends and closes it); `*fd` is -1 only when
+ * the fence was successfully waited on the CPU instead (no exportable fence, an already-signalled one,
+ * or a failed export that fell back to a real wait): the service may then read the images at once. Any
+ * reset/submit/wait failure returns its error with `*fd` at -1: nothing readable may be sent. */
+XrResult qb_vk_end_frame_fence(struct qb_vk *vk, int *fd);
 
 #endif

@@ -288,12 +288,24 @@ public final class TurnipDriver {
      * on a GPU neither build covers).
      */
     public String install() {
-        String id = choose();
+        return install(choose());
+    }
+
+    /** {@link #install()} for a driver the caller picked (the headset's VR session pins its own). */
+    public String install(String id) {
         if (id == null) return null;
         File dir = new File(contentDir, id);
-        if (!new File(dir, "meta.json").isFile()) {
+        // A bundled driver is unpacked once per APK: the stamp is the install time of the package that
+        // carried it, so a rebuilt driver under the same id replaces the stale unpacked copy. Imported
+        // drivers are never stamped or re-unpacked (an import may legitimately contain any file name).
+        boolean bundled = BUNDLED.contains(id);
+        File stamp = new File(dir, ".apk");
+        String apk = bundled ? packageUpdateTime() : "";
+        if (!new File(dir, "meta.json").isFile()
+                || (bundled && !apk.equals(nullToEmpty(FileUtils.readString(stamp))))) {
             FileUtils.delete(dir);
-            if (!TarZst.extractAsset(context, "graphics_driver/adrenotools-" + id + ".tzst", dir)) {
+            if (!TarZst.extractAsset(context, "graphics_driver/adrenotools-" + id + ".tzst", dir)
+                    || (bundled && !FileUtils.writeString(stamp, apk))) {
                 Log.e(TAG, "could not unpack " + id);
                 FileUtils.delete(dir);
                 return null;
@@ -302,10 +314,24 @@ public final class TurnipDriver {
         String library = libraryName(id);
         if (library == null || !new File(dir, library).isFile()) {
             Log.e(TAG, id + " unpacked without " + library);
+            // Never leave a bad bundled unpack stamped as current; an import is the user's to remove.
+            if (bundled) FileUtils.delete(dir);
             return null;
         }
         Log.i(TAG, "graphics driver " + id + " (" + library + ")");
         return id;
+    }
+
+    private String packageUpdateTime() {
+        try {
+            return Long.toString(context.getPackageManager().getPackageInfo(context.getPackageName(), 0).lastUpdateTime);
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return "";
+        }
+    }
+
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
     }
 
     /**

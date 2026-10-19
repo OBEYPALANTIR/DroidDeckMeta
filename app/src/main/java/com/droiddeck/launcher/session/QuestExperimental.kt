@@ -9,7 +9,10 @@ import java.io.File
 /** Device-detected defaults and launch evidence for experimental Quest compatibility. */
 object QuestExperimental {
     private const val TAG = "QuestExperimental"
-    const val DRIVER = "turnip25.1.0-quest1"
+    const val DRIVER = "turnip-quest"
+    /** The first Quest adapter wrapped upstream's phone Turnip (Mesa 25.0.0-devel), whose gralloc
+     *  sniff never recognised Quest buffers; installs that stored it move to the current driver. */
+    private const val LEGACY_DRIVER = "turnip25.1.0-quest1"
 
     // Quest 2 has an A6xx GPU and cannot use this bundled A7xx driver.
     internal fun supported(model: String, device: String, manufacturer: String): Boolean =
@@ -34,6 +37,9 @@ object QuestExperimental {
                 .putBoolean("hdr.steam", true)
                 .putBoolean("questDefaultsV1", true)
                 .apply()
+        }
+        if (prefs.getString("androidDriver", "") == LEGACY_DRIVER) {
+            prefs.edit().putString("androidDriver", DRIVER).apply()
         }
         val report = buildString {
             appendLine("DroidDeck Quest Experimental ${BuildConfig.VERSION_NAME}")

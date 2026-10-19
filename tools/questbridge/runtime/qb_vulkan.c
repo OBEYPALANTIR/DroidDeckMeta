@@ -1,7 +1,8 @@
 /* qb_vulkan.c - the Vulkan half of libopenxr_questbridge.so (qb_vulkan.h): XR_KHR_vulkan_enable(2), the
  * service's gralloc dma-bufs imported into the app's device, the guest-owned images an app gets where those
- * cannot be handed over directly, the blit/resolve into the imported image on release, and the frame's
- * sync_file. Nothing links libvulkan: every entry point comes through a vkGetInstanceProcAddr. */
+ * cannot be handed over directly, the blit/resolve (or the direct image's ownership handoff) on release,
+ * the acquire handoff that puts direct images in the app layout, and the frame's sync_file. Nothing links
+ * libvulkan: every entry point comes through a vkGetInstanceProcAddr. */
 #define VK_NO_PROTOTYPES 1
 #define XR_NO_PROTOTYPES 1
 #define XR_USE_GRAPHICS_API_VULKAN 1
@@ -82,11 +83,18 @@ struct qb_vk {
     int sync_fd; /* the frame fence exports as a sync_file */
     VkPhysicalDeviceMemoryProperties mem;
     VkCommandPool pool;
-    VkFence fence;
+    /* A ring of frame fences: reuse only after completion or a successful SYNC_FD export, which
+     * transfers the queued payload and resets the source fence. */
+    VkFence frame[QB_MAX_SWAPCHAIN_IMAGES];
+    uint8_t frame_pending[QB_MAX_SWAPCHAIN_IMAGES];
+    uint32_t frame_next;
 };
 
-/* shortcut: images reach the app UNDEFINED, not in OpenXR's acquire layout, because xrCreateSwapchain may not
- * touch the queue; Turnip lays images out the same in every layout. A transition needs a first-acquire hook. */
+/* Direct images cross an explicit handoff (enum qb_direct_state): FRESH (UNDEFINED, just imported) to APP
+ * (COLOR_ATTACHMENT_OPTIMAL, the OpenXR acquire layout) on first acquire, APP to SERVICE (GENERAL, owned
+ * by FOREIGN) on release, SERVICE to APP on re-acquire. Indirect and local swapchains still hand their
+ * guest-owned images over UNDEFINED on first acquire; Turnip lays images out the same in every layout. */
+enum qb_direct_state { QB_DIRECT_FRESH, QB_DIRECT_APP, QB_DIRECT_SERVICE };
 struct qb_vk_swapchain {
     uint32_t count;
     int indirect;
@@ -94,8 +102,12 @@ struct qb_vk_swapchain {
     VkDeviceMemory app_mem[QB_MAX_SWAPCHAIN_IMAGES];
     VkImage imp[QB_MAX_SWAPCHAIN_IMAGES]; /* over the service's dma-bufs; none in a local swapchain */
     VkDeviceMemory imp_mem[QB_MAX_SWAPCHAIN_IMAGES];
-    VkCommandBuffer cmd[QB_MAX_SWAPCHAIN_IMAGES]; /* app[i] into imp[i] */
-    VkImage resolve;                              /* multisampled BGRA: a resolve cannot change formats */
+    VkCommandBuffer cmd[QB_MAX_SWAPCHAIN_IMAGES];     /* indirect: app[i] into imp[i] */
+    VkCommandBuffer first[QB_MAX_SWAPCHAIN_IMAGES];   /* direct first acquire: UNDEFINED to the app layout */
+    VkCommandBuffer acquire[QB_MAX_SWAPCHAIN_IMAGES]; /* direct re-acquire: GENERAL/FOREIGN to the app layout */
+    VkCommandBuffer release[QB_MAX_SWAPCHAIN_IMAGES]; /* direct release: the app layout to GENERAL/FOREIGN */
+    uint8_t state[QB_MAX_SWAPCHAIN_IMAGES];           /* direct handoff state; untouched when not direct */
+    VkImage resolve;                                  /* multisampled BGRA: a resolve cannot change formats */
     VkDeviceMemory resolve_mem;
 };
 
@@ -320,8 +332,8 @@ XrResult qb_vk_physical_device2(const XrVulkanGraphicsDeviceGetInfoKHR *info, Vk
 
 /* ---- session binding */
 
-/* The frame fence, exportable as a sync_file where the driver can do that (else xrEndFrame waits for it). */
-static VkResult create_fence(struct qb_vk *vk) {
+/* The frame fences, exportable as sync_files where the driver can do that (else xrEndFrame waits). */
+static VkResult create_fences(struct qb_vk *vk) {
     VkPhysicalDeviceExternalFenceInfo info = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
                                               .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
     VkExternalFenceProperties props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES};
@@ -332,7 +344,11 @@ static VkResult create_fence(struct qb_vk *vk) {
     VkExportFenceCreateInfo exp = {.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
                                    .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
     VkFenceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = vk->sync_fd ? &exp : NULL};
-    return vk->fn.CreateFence(vk->device, &ci, NULL, &vk->fence);
+    for (uint32_t i = 0; i < QB_COUNT(vk->frame); i++) {
+        VkResult r = vk->fn.CreateFence(vk->device, &ci, NULL, &vk->frame[i]);
+        if (r != VK_SUCCESS) return r;
+    }
+    return VK_SUCCESS;
 }
 
 /* Everything qb_vk_bind sets up on the app's device; free_vk undoes a partial run. */
@@ -366,12 +382,13 @@ static XrResult init_vk(struct qb_vk *vk, const XrGraphicsBindingVulkanKHR *bind
     VkCommandPoolCreateInfo pool = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .queueFamilyIndex = vk->family};
     VkResult r = vk->fn.CreateCommandPool(vk->device, &pool, NULL, &vk->pool);
-    if (r == VK_SUCCESS) r = create_fence(vk);
+    if (r == VK_SUCCESS) r = create_fences(vk);
     return r == VK_SUCCESS ? XR_SUCCESS : xr_from_vk(r);
 }
 
 static void free_vk(struct qb_vk *vk) {
-    if (vk->fence) vk->fn.DestroyFence(vk->device, vk->fence, NULL);
+    for (uint32_t i = 0; i < QB_COUNT(vk->frame); i++)
+        if (vk->frame[i]) vk->fn.DestroyFence(vk->device, vk->frame[i], NULL);
     if (vk->pool) vk->fn.DestroyCommandPool(vk->device, vk->pool, NULL);
     free(vk);
 }
@@ -606,8 +623,9 @@ static XrResult local_image(struct qb_vk *vk, const XrSwapchainCreateInfo *ci, V
 static VkResult record_copy(struct qb_vk *vk, struct qb_vk_swapchain *sc, const XrSwapchainCreateInfo *ci,
                             VkFormat imported, uint32_t i) {
     const uint32_t w = ci->width, h = ci->height, layers = ci->arraySize;
-    const uint32_t outside = vk->foreign ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED;
-    const uint32_t ours = vk->foreign ? vk->family : VK_QUEUE_FAMILY_IGNORED;
+    /* import_swapchain refuses service-backed imports without VK_EXT_queue_family_foreign */
+    const uint32_t outside = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    const uint32_t ours = vk->family;
     const VkImageSubresourceRange app_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
     const VkImageSubresourceRange imp_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkCommandBuffer cb = sc->cmd[i];
@@ -730,9 +748,74 @@ static XrResult make_indirect(struct qb_vk *vk, struct qb_vk_swapchain *sc, cons
     return r == VK_SUCCESS ? XR_SUCCESS : xr_from_vk(r);
 }
 
+/* One direct-handoff barrier, recorded once; SIMULTANEOUS_USE matches the indirect copies. */
+static VkResult record_handoff(struct qb_vk *vk, VkCommandBuffer cb, VkImage image, VkAccessFlags src_access,
+                               VkAccessFlags dst_access, VkImageLayout old_layout, VkImageLayout new_layout,
+                               uint32_t src_q, uint32_t dst_q, VkPipelineStageFlags src_stage,
+                               VkPipelineStageFlags dst_stage) {
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                      .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT};
+    VkResult r = vk->fn.BeginCommandBuffer(cb, &begin);
+    if (r != VK_SUCCESS) return r;
+    VkImageMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                              .srcAccessMask = src_access,
+                              .dstAccessMask = dst_access,
+                              .oldLayout = old_layout,
+                              .newLayout = new_layout,
+                              .srcQueueFamilyIndex = src_q,
+                              .dstQueueFamilyIndex = dst_q,
+                              .image = image,
+                              .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vk->fn.CmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+    return vk->fn.EndCommandBuffer(cb);
+}
+
+/* The direct handoff commands: first acquire out of UNDEFINED, re-acquire from the service's
+ * GENERAL/FOREIGN, release back to it. Submitted on the bound queue in acquire/release order, so the
+ * app's rendering (queued between them) is covered by queue order. */
+static XrResult make_direct(struct qb_vk *vk, struct qb_vk_swapchain *sc) {
+    const VkAccessFlags app_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                      .commandPool = vk->pool,
+                                      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                      .commandBufferCount = sc->count};
+    VkResult r = vk->fn.AllocateCommandBuffers(vk->device, &ai, sc->first);
+    if (r == VK_SUCCESS) r = vk->fn.AllocateCommandBuffers(vk->device, &ai, sc->acquire);
+    if (r == VK_SUCCESS) r = vk->fn.AllocateCommandBuffers(vk->device, &ai, sc->release);
+    for (uint32_t i = 0; i < sc->count && r == VK_SUCCESS; i++) {
+        /* Take the service's external allocation before the app's first write; no contents to preserve yet. */
+        r = record_handoff(vk, sc->first[i], sc->imp[i], 0, app_access, VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+                           vk->family, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        /* the service left GENERAL with its contents, owned by FOREIGN */
+        if (r == VK_SUCCESS)
+            r = record_handoff(vk, sc->acquire[i], sc->imp[i], 0, app_access, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, vk->family,
+                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        /* the app's rendering, through whatever stages it used, back to the sharing layout */
+        if (r == VK_SUCCESS)
+            r = record_handoff(vk, sc->release[i], sc->imp[i], VK_ACCESS_MEMORY_WRITE_BIT, 0,
+                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, vk->family,
+                               VK_QUEUE_FAMILY_FOREIGN_EXT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
+    return r == VK_SUCCESS ? XR_SUCCESS : xr_from_vk(r);
+}
+
+/* One pre-recorded handoff/copy buffer on the bound queue; the app's work around it is ordered by queue. */
+static XrResult submit_one(struct qb_vk *vk, VkCommandBuffer cb) {
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    VkResult r = vk->fn.QueueSubmit(vk->queue, 1, &si, VK_NULL_HANDLE);
+    return r == VK_SUCCESS ? XR_SUCCESS : xr_from_vk(r);
+}
+
 /* Everything a swapchain holds; also the cleanup of a half-built one (null handles are no-ops). */
 static void free_swapchain(struct qb_vk *vk, struct qb_vk_swapchain *sc) {
     vk->fn.FreeCommandBuffers(vk->device, vk->pool, QB_MAX_SWAPCHAIN_IMAGES, sc->cmd);
+    vk->fn.FreeCommandBuffers(vk->device, vk->pool, QB_MAX_SWAPCHAIN_IMAGES, sc->first);
+    vk->fn.FreeCommandBuffers(vk->device, vk->pool, QB_MAX_SWAPCHAIN_IMAGES, sc->acquire);
+    vk->fn.FreeCommandBuffers(vk->device, vk->pool, QB_MAX_SWAPCHAIN_IMAGES, sc->release);
     for (uint32_t i = 0; i < QB_MAX_SWAPCHAIN_IMAGES; i++) {
         if (sc->app[i] != sc->imp[i]) vk->fn.DestroyImage(vk->device, sc->app[i], NULL);
         vk->fn.DestroyImage(vk->device, sc->imp[i], NULL);
@@ -747,6 +830,12 @@ static void free_swapchain(struct qb_vk *vk, struct qb_vk_swapchain *sc) {
 static XrResult import_swapchain(struct qb_vk *vk, const XrSwapchainCreateInfo *ci,
                                  const struct qb_swapchain_info *info, int *fds, uint32_t count,
                                  struct qb_vk_swapchain **out) {
+    /* every service-backed image changes hands across VK_EXT_queue_family_foreign; without it there is
+     * no handoff the service would honour, so the import is refused rather than forged with IGNORED */
+    if (!vk->foreign) {
+        QB_ERR("the device lacks VK_EXT_queue_family_foreign, which the service handoff crosses\n");
+        return XR_ERROR_FEATURE_UNSUPPORTED;
+    }
     const VkFormat format = (VkFormat)ci->format, imported = service_format(format);
     const uint32_t w = ci->width * ci->arraySize, h = ci->height;
     VkFormat pair[2] = {imported, srgb_partner(imported)};
@@ -783,10 +872,12 @@ static XrResult import_swapchain(struct qb_vk *vk, const XrSwapchainCreateInfo *
     for (uint32_t i = 0; i < count && XR_SUCCEEDED(xr); i++)
         xr = import_image(vk, imported, w, h, usage, views, info, &fds[i], &sc->imp[i], &sc->imp_mem[i]);
     if (XR_SUCCEEDED(xr)) {
-        if (indirect)
+        if (indirect) {
             xr = make_indirect(vk, sc, ci, imported);
-        else
+        } else {
             memcpy(sc->app, sc->imp, sizeof(sc->app));
+            xr = make_direct(vk, sc);
+        }
     }
     if (XR_FAILED(xr)) {
         free_swapchain(vk, sc);
@@ -846,14 +937,28 @@ int qb_vk_swapchain_is_indirect(const struct qb_vk_swapchain *sc) {
     return sc->indirect;
 }
 
-XrResult qb_vk_swapchain_release(struct qb_vk *vk, struct qb_vk_swapchain *sc, uint32_t index) {
-    if (!sc->indirect) return XR_SUCCESS;
+XrResult qb_vk_swapchain_acquire(struct qb_vk *vk, struct qb_vk_swapchain *sc, uint32_t index) {
     if (index >= sc->count) return XR_ERROR_RUNTIME_FAILURE;
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                       .commandBufferCount = 1,
-                       .pCommandBuffers = &sc->cmd[index]};
-    VkResult r = vk->fn.QueueSubmit(vk->queue, 1, &si, VK_NULL_HANDLE);
-    return r == VK_SUCCESS ? XR_SUCCESS : xr_from_vk(r);
+    if (sc->indirect || !sc->imp[index]) return XR_SUCCESS; /* guest-owned app image: no handoff */
+    VkCommandBuffer cb;
+    if (sc->state[index] == QB_DIRECT_FRESH) cb = sc->first[index];
+    else if (sc->state[index] == QB_DIRECT_SERVICE) cb = sc->acquire[index];
+    else return XR_ERROR_CALL_ORDER_INVALID; /* already with the app */
+    XrResult xr = submit_one(vk, cb);
+    if (XR_FAILED(xr)) return xr;
+    sc->state[index] = QB_DIRECT_APP;
+    return XR_SUCCESS;
+}
+
+XrResult qb_vk_swapchain_release(struct qb_vk *vk, struct qb_vk_swapchain *sc, uint32_t index) {
+    if (index >= sc->count) return XR_ERROR_RUNTIME_FAILURE;
+    if (sc->indirect) return submit_one(vk, sc->cmd[index]);
+    if (!sc->imp[index]) return XR_SUCCESS; /* local swapchain: nothing to hand over */
+    if (sc->state[index] != QB_DIRECT_APP) return XR_ERROR_CALL_ORDER_INVALID; /* never acquired */
+    XrResult xr = submit_one(vk, sc->release[index]);
+    if (XR_FAILED(xr)) return xr;
+    sc->state[index] = QB_DIRECT_SERVICE;
+    return XR_SUCCESS;
 }
 
 uint32_t qb_vk_extra_formats(uint32_t cap, int64_t *out) {
@@ -871,25 +976,48 @@ int qb_vk_format_is_local(int64_t format) {
 
 /* ---- frame completion */
 
-int qb_vk_end_frame_fence(struct qb_vk *vk) {
-    VkResult r = vk->fn.ResetFences(vk->device, 1, &vk->fence);
+XrResult qb_vk_end_frame_fence(struct qb_vk *vk, int *fd) {
+    *fd = -1;
+    const uint32_t slot = vk->frame_next;
+    VkFence fence = vk->frame[slot];
+    if (vk->frame_pending[slot]) {
+        /* an earlier frame still owns this slot: its signal must land before the fence is reused */
+        VkResult r = vk->fn.WaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (r != VK_SUCCESS) {
+            QB_ERR("waiting for the previous frame fence -> %d\n", (int)r);
+            return xr_from_vk(r);
+        }
+        vk->frame_pending[slot] = 0;
+    }
+    VkResult r = vk->fn.ResetFences(vk->device, 1, &fence);
     /* no batches: the fence signals once everything already on the queue has finished */
-    if (r == VK_SUCCESS) r = vk->fn.QueueSubmit(vk->queue, 0, NULL, vk->fence);
+    if (r == VK_SUCCESS) r = vk->fn.QueueSubmit(vk->queue, 0, NULL, fence);
     if (r != VK_SUCCESS) {
         QB_ERR("submitting the frame fence -> %d\n", (int)r);
-        vk->fn.QueueWaitIdle(vk->queue);
-        return -1;
+        return xr_from_vk(r);
     }
+    vk->frame_pending[slot] = 1;
+    vk->frame_next = (slot + 1) % QB_COUNT(vk->frame);
     if (vk->sync_fd) {
         VkFenceGetFdInfoKHR get = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
-                                   .fence = vk->fence,
+                                   .fence = fence,
                                    .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
-        int fd = -1;
+        int out = -1;
         /* success with -1 means already signalled: nothing for the service to wait for */
-        if (vk->fn.GetFenceFdKHR(vk->device, &get, &fd) == VK_SUCCESS) return fd;
+        if (vk->fn.GetFenceFdKHR(vk->device, &get, &out) == VK_SUCCESS) {
+            *fd = out;
+            /* Copy-transference export resets the source fence even for a positive fd. */
+            vk->frame_pending[slot] = 0;
+            return XR_SUCCESS;
+        }
         QB_ERR("vkGetFenceFdKHR(SYNC_FD) failed: every xrEndFrame waits for the GPU from now on\n");
         vk->sync_fd = 0;
     }
-    vk->fn.WaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
-    return -1;
+    r = vk->fn.WaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        QB_ERR("waiting for the frame fence -> %d\n", (int)r);
+        return xr_from_vk(r);
+    }
+    vk->frame_pending[slot] = 0;
+    return XR_SUCCESS;
 }
