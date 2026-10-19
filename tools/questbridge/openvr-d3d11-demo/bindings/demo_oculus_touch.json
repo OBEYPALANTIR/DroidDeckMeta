@@ -1,0 +1,29 @@
+{
+  "name": "DroidDeck D3D11 demo (Touch)",
+  "description": "Default Oculus Touch bindings for openvr-d3d11-demo; xrizer maps the Quest 3 controllers to this type.",
+  "controller_type": "oculus_touch",
+  "bindings": {
+    "/actions/demo": {
+      "sources": [
+        { "path": "/user/hand/left/input/trigger", "mode": "trigger", "inputs": { "pull": { "output": "/actions/demo/in/trigger" } } },
+        { "path": "/user/hand/right/input/trigger", "mode": "trigger", "inputs": { "pull": { "output": "/actions/demo/in/trigger" } } },
+        { "path": "/user/hand/left/input/grip", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/grip" } } },
+        { "path": "/user/hand/right/input/grip", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/grip" } } },
+        { "path": "/user/hand/left/input/joystick", "mode": "joystick", "inputs": { "position": { "output": "/actions/demo/in/thumbstick" } } },
+        { "path": "/user/hand/right/input/joystick", "mode": "joystick", "inputs": { "position": { "output": "/actions/demo/in/thumbstick" } } },
+        { "path": "/user/hand/left/input/x", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/a_button" } } },
+        { "path": "/user/hand/left/input/y", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/b_button" } } },
+        { "path": "/user/hand/right/input/a", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/a_button" } } },
+        { "path": "/user/hand/right/input/b", "mode": "button", "inputs": { "click": { "output": "/actions/demo/in/b_button" } } }
+      ],
+      "poses": [
+        { "output": "/actions/demo/in/hand_left", "path": "/user/hand/left/pose/raw" },
+        { "output": "/actions/demo/in/hand_right", "path": "/user/hand/right/pose/raw" }
+      ],
+      "haptics": [
+        { "output": "/actions/demo/out/haptic", "path": "/user/hand/left/output/haptic" },
+        { "output": "/actions/demo/out/haptic", "path": "/user/hand/right/output/haptic" }
+      ]
+    }
+  }
+}

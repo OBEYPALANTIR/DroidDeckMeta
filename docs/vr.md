@@ -223,6 +223,38 @@ The Windows OpenXR path through `wineopenxr`, and the alternative
 OpenComposite + Windows OpenXR runtime inside the prefix, remain unvalidated
 as complete rendering paths on this fork.
 
+## Windows D3D11 OpenVR demo (not yet run on a headset)
+
+`tools/questbridge/openvr-d3d11-demo/` is the smallest x64 Windows OpenVR
+application for the missing proof above: one D3D11 device, two
+`R8G8B8A8_UNORM` eye render targets (recommended size, clamped to 1024x1024),
+submitted through `IVRCompositor::Submit` with `TextureType_DirectX`. The
+intended pipeline is D3D11 -> Proton/FEX + DXVK -> Proton vrclient (the
+texture's native Vulkan image/device/queue) -> arm64 xrizer -> QuestBridge
+runtime -> DMA_BUF images + fences -> XR service -> Meta compositor. It does
+not use the two-device NT-handle relay of the sharing probe.
+
+`--mode eyes` (default) renders a red left eye with a white "L" and a blue right
+eye with a white "R", plus the frame counter as a 16-bar pattern so a captured
+frame is identifiable. `--mode scene` renders a checkerboard floor and cubes
+from `GetProjectionMatrix` / `GetEyeToHeadTransform` / `WaitGetPoses`, one
+tracked cube per controller through an action manifest (`actions.json`, Touch
+bindings: trigger scales the cube, A/B fire `TriggerHapticVibrationAction`).
+`--seconds N` or `VREvent_Quit` ends it with exit 0; `VR_Init` or `Submit`
+failures exit 1 with the enum symbol. `--selftest` renders both modes with no
+VR runtime and checks the eye corner pixels.
+
+Build with `bash tools/questbridge/openvr-d3d11-demo/build-demo.sh` (the
+probe's mingw container and OpenVR pin, static link). Stage into
+`/tmp/droiddeck-diagnostics/` and run it with `droiddeckctl guest` and
+`droiddeck-proton-run` inside `droiddeckctl start vr`, as the probe does;
+`tools/questbridge/openvr-d3d11-demo/LAUNCH.md` has the exact commands.
+Status: the source compiles and links as a `pei-x86-64` PE; the Docker build,
+the `--selftest` under Wine and every headset step are **NOT RUN** (no Quest 3
+connected when this was written). A headset claim needs the 1 Hz
+`frame=... submitL=... submitR=...` lines, a captured frame per eye, and the
+session bundle per "Reporting a headset run".
+
 ## READY recovery is not GPU recovery
 
 In session `2026-10-13-11-vr`, restoring the Quest defaults
