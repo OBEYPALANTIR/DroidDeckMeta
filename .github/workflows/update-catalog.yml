@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   catalog:
+    # The publisher app and catalog generator below target Droid-Deck/DroidDeck-CI.
+    if: github.repository == 'Droid-Deck/DroidDeck'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

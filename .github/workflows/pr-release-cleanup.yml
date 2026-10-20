@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   cleanup:
+    if: github.repository == 'Droid-Deck/DroidDeck'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -73,6 +74,6 @@ jobs:
 
   catalog:
     needs: cleanup
-    if: ${{ always() }}
+    if: ${{ always() && github.repository == 'Droid-Deck/DroidDeck' }}
     uses: ./.github/workflows/update-catalog.yml
     secrets: inherit

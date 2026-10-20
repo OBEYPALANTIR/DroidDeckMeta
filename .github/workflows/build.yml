@@ -549,6 +549,15 @@ jobs:
           grep -qi "CN=Android, OU=Android, O=Android" /tmp/sig.txt \
             || { echo "::error::apk is not signed with the AOSP testkey"; exit 1; }
 
+      - uses: actions/upload-artifact@v4
+        id: apk-artifact
+        with:
+          name: droiddeck-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
       - name: Report on the pull request
         if: always() && github.event_name == 'pull_request'
         continue-on-error: true
@@ -556,7 +565,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          ARTIFACT_URL: ${{ steps.apk-artifact.outputs.artifact-url }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -uo pipefail
@@ -567,24 +577,28 @@ jobs:
             echo
             [ -f /tmp/pr-merge.md ] && cat /tmp/pr-merge.md
             echo
-            case "$BUILD_OUTCOME" in
+            case "$JOB_STATUS" in
               success)
                 echo "###  Build passed"
                 echo
-                echo "The \`droiddeck-apk\` artifact is [on this run]($RUN_URL), signed with the public test key."
+                echo "The [\`droiddeck-apk\` artifact]($ARTIFACT_URL) is signed with the public test key."
                 echo
-                if [ "$SAME_REPO" = true ]; then
-                  echo "A release-signed tester build that installs over Stable or Preview is being published now and will appear in DroidDeck's **Test builds** list. Label the PR \`no-test-build\` to skip that."
+                if [ "$GITHUB_REPOSITORY" != Droid-Deck/DroidDeck ]; then
+                  echo "Fork builds provide this test-key artifact only; automatic upstream signing and publication are disabled. See [CI and releases]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/main/docs/development/ci-releases.md) for the release setup."
                 else
-                  echo "**Maintainer:** add the \`publish-test\` label to publish a release-signed tester build that installs over Stable or Preview and appears in DroidDeck's **Test builds** list. The label is removed automatically after publishing."
+                  if [ "$SAME_REPO" = true ]; then
+                    echo "A release-signed tester build that installs over Stable or Preview is being published now and will appear in DroidDeck's **Test builds** list. Label the PR \`no-test-build\` to skip that."
+                  else
+                    echo "**Maintainer:** add the \`publish-test\` label to publish a release-signed tester build that installs over Stable or Preview and appears in DroidDeck's **Test builds** list. The label is removed automatically after publishing."
+                  fi
+                  echo
+                  echo "Fallback: [open **PR Release Publish**]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/pr-release-publish.yml) on \`main\` and enter PR \`$PR\`."
                 fi
-                echo
-                echo "Fallback: [open **PR Release Publish**]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/pr-release-publish.yml) on \`main\` and enter PR \`$PR\`."
                 ;;
               failure)
-                echo "### ERROR: Build failed"
+                echo "### ERROR: Build pipeline failed"
                 echo
-                echo "The compiler's errors ([full log]($RUN_URL)):"
+                echo "A build, validation, or artifact upload step failed. See the [failed step and full log]($RUN_URL). Compiler diagnostics, if available:"
                 echo
                 echo '```'
                 { grep -E '^e: |^w: .*error|error:|CMake Error|fatal error|ninja: error|FAILED|What went wrong|Execution failed for task|Unresolved reference|Type mismatch|Unresolved' /tmp/build.log 2>/dev/null \
@@ -615,17 +629,10 @@ jobs:
             gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -F body=@/tmp/pr-report.md >/dev/null
           fi
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: droiddeck-apk
-          path: app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-          retention-days: 30
-          compression-level: 0
-
   sign:
     needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # This automatic signing pipeline publishes to the upstream organization's release service.
+    if: github.repository == 'Droid-Deck/DroidDeck' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       actions: read
@@ -643,7 +650,7 @@ jobs:
   # DISCORD_BUILDS_WEBHOOK is the channel's webhook URL.
   announce:
     needs: [build, sign]
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.repository == 'Droid-Deck/DroidDeck' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -773,6 +780,6 @@ jobs:
 
   catalog:
     needs: announce
-    if: ${{ always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.announce.result != 'skipped' }}
+    if: ${{ always() && github.repository == 'Droid-Deck/DroidDeck' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.announce.result != 'skipped' }}
     uses: ./.github/workflows/update-catalog.yml
     secrets: inherit
