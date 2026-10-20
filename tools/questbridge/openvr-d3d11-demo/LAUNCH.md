@@ -32,22 +32,25 @@ bash tools/questbridge/openvr-d3d11-demo/build-demo.sh
 `actions.json` must stay beside the executable: the demo resolves the manifest
 from its own directory (`GetModuleFileNameA`).
 
-Without a headset or VR runtime, `openvr-d3d11-demo.exe --selftest` (Wine or
-Windows) creates the device and both 1024x1024 eye textures, renders one frame
-of each mode, verifies the eye corner pixels and exits 0 with
-`PASS selftest eyes+scene rendered`.
+Without a VR runtime, `openvr-d3d11-demo.exe --selftest` creates the device
+and both 1024x1024 eye textures, renders one frame of each mode, reads back
+the eye corner pixels and a sky and floor pixel of the scene, and exits 0 with
+`PASS selftest eyes+scene rendered`. It still needs a hardware D3D11 adapter
+(DXVK on the guest, or Windows); a GPU-less Wine container cannot run it.
 
 ## Stage into the guest
 
-Deliver like the sharing probe: outside games and existing prefixes, into
+As with the sharing probe, keep it outside games and existing prefixes, in
 `/tmp/droiddeck-diagnostics/`, with no registered shortcut pointing at it.
 Internal storage is visible in the guest as `/root/Storage`
-(`app/src/main/java/com/droiddeck/launcher/frontend/AddedGames.kt`).
+(`app/src/main/java/com/droiddeck/launcher/frontend/AddedGames.kt`). Remove the
+previous staging first so a rebuild never runs a stale executable.
 
 ```sh
+adb shell rm -rf /sdcard/Download/DroidDeck/diagnostics/openvr-d3d11-demo
 adb push app/build/questbridge/openvr-d3d11-demo /sdcard/Download/DroidDeck/diagnostics/openvr-d3d11-demo
 tools/droiddeckctl guest -- sh -c \
-  'mkdir -p /tmp/droiddeck-diagnostics && cp -R /root/Storage/Download/DroidDeck/diagnostics/openvr-d3d11-demo /tmp/droiddeck-diagnostics/'
+  'rm -rf /tmp/droiddeck-diagnostics/openvr-d3d11-demo && mkdir -p /tmp/droiddeck-diagnostics && cp -R /root/Storage/Download/DroidDeck/diagnostics/openvr-d3d11-demo /tmp/droiddeck-diagnostics/'
 ```
 
 ## Launch through the existing VR path
@@ -62,26 +65,41 @@ session exactly like the probe's `--vr` mode. Set both variables on every call
 `WINEDLLOVERRIDES=d3d11,dxgi=n` selects the installed native DXVK DLLs) and
 keep an outer process timeout: `WaitGetPoses` may block.
 
+Run `--help` first (the executable's own Proton prefix is created on the first
+launch, which must not eat the VR run's timeout), then `--selftest` (D3D11 +
+DXVK without VR), then the VR phases.
+
 ```sh
 tools/droiddeckctl start vr --wait
+
+DEMO=/tmp/droiddeck-diagnostics/openvr-d3d11-demo/openvr-d3d11-demo.exe
+tools/droiddeckctl guest --timeout 105 \
+  --env DROIDDECK_NO_STEAM=1 --env WINEDLLOVERRIDES=d3d11,dxgi=n -- sh -c \
+  "timeout -k 5s 75s droiddeck-proton-run $DEMO --help"
+tools/droiddeckctl guest --timeout 105 \
+  --env DROIDDECK_NO_STEAM=1 --env WINEDLLOVERRIDES=d3d11,dxgi=n -- sh -c \
+  "timeout -k 5s 75s droiddeck-proton-run $DEMO --selftest"
 
 # Phase A: red "L" / blue "R" eyes with the frame counter as a 16-bar pattern
 tools/droiddeckctl guest --timeout 105 \
   --env DROIDDECK_NO_STEAM=1 --env WINEDLLOVERRIDES=d3d11,dxgi=n -- sh -c \
-  'timeout -k 5s 75s droiddeck-proton-run /tmp/droiddeck-diagnostics/openvr-d3d11-demo/openvr-d3d11-demo.exe --mode eyes --seconds 30'
+  "timeout -k 5s 75s droiddeck-proton-run $DEMO --mode eyes --seconds 30"
 
 # Phase B: checkerboard floor, cubes, one tracked cube per controller
-tools/droiddeckctl guest --timeout 105 \
+tools/droiddeckctl guest --timeout 150 \
   --env DROIDDECK_NO_STEAM=1 --env WINEDLLOVERRIDES=d3d11,dxgi=n -- sh -c \
-  'timeout -k 5s 75s droiddeck-proton-run /tmp/droiddeck-diagnostics/openvr-d3d11-demo/openvr-d3d11-demo.exe --mode scene --seconds 60'
+  "timeout -k 5s 120s droiddeck-proton-run $DEMO --mode scene --seconds 60"
 
 tools/droiddeckctl logs latest ./session-artifacts
 ```
 
 Exit codes: 0 after `--seconds` or `VREvent_Quit` (`PASS frames=N`); 1 on
-`VR_Init` failure or any `Submit` error, printing the enum symbol
-(`FAIL stage=vr-init err=VRInitError_...`, `FAIL stage=submit eye=L err=VRCompositorError_...`);
-2 on bad arguments. Once per second the demo logs
+`VR_Init` failure, any `Submit` error (enum symbol and frame number printed:
+`FAIL stage=vr-init err=VRInitError_...`,
+`FAIL stage=submit eye=L err=VRCompositorError_... frame=N`) or a failed D3D11
+call (`FAIL stage=<stage> hr=0x...`); 2 on bad arguments. `Submit` errors
+include `VRCompositorError_DoNotHaveFocus`, so do not open the system menu
+during a run. Once per second the demo logs
 `frame= fmt= size= texL= texR= submitL= submitR=`; in scene mode it also logs
 the action values when they changed (`input: trigger L= R= stick ... grip= a= b=`).
 

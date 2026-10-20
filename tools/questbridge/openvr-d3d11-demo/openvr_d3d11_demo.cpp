@@ -379,13 +379,16 @@ struct Actions {
 			input->GetAnalogActionData(trigger, &an, sizeof(an), handSource[i]);
 			hands[i].trigger = an.bActive ? an.x : 0;
 		}
+		// Per hand: activeOrigin is an origin handle, not the input-source handle
+		// ulRestrictToDevice wants (xrizer would buzz both controllers).
 		vr::VRActionHandle_t buttons[2] = { a, b };
-		for (int i = 0; i < 2; i++) {
-			vr::InputDigitalActionData_t d = {};
-			input->GetDigitalActionData(buttons[i], &d, sizeof(d), vr::k_ulInvalidInputValueHandle);
-			if (d.bActive && d.bChanged && d.bState)
-				input->TriggerHapticVibrationAction(haptic, 0, 0.1f, 100, 0.8f, d.activeOrigin);
-		}
+		for (int h = 0; h < 2; h++)
+			for (int i = 0; i < 2; i++) {
+				vr::InputDigitalActionData_t d = {};
+				input->GetDigitalActionData(buttons[i], &d, sizeof(d), handSource[h]);
+				if (d.bActive && d.bChanged && d.bState)
+					input->TriggerHapticVibrationAction(haptic, 0, 0.1f, 100, 0.8f, handSource[h]);
+			}
 	}
 
 	// Once per second: print the action values if any changed since the last print.
@@ -431,6 +434,15 @@ static int selftest() {
 		printf("selftest: eyes %c corner=(%u,%u,%u,%u)\n", eye ? 'R' : 'L', px[0], px[1], px[2], px[3]);
 		if (memcmp(px, want[eye], 4)) { printf("FAIL stage=selftest-eyes corner pixel mismatch\n"); return 1; }
 		renderScene(r, eye, mul(perspective(0.1f, 100), view), hands);
+		// Sky in the corner; a floor checker square (grey c0 or c1, never sky) below
+		// centre-right, which only holds if the MVP/inverse/floor rotation chain is right.
+		uint8_t sky[4], floor[4];
+		r.readPixel(eye, 8, 8, sky);
+		r.readPixel(eye, r.w * 3 / 4, r.h * 3 / 4, floor);
+		printf("selftest: scene %c sky=(%u,%u,%u) floor=(%u,%u,%u)\n", eye ? 'R' : 'L', sky[0], sky[1], sky[2], floor[0], floor[1], floor[2]);
+		bool skyOk = sky[0] == 13 && sky[1] == 13 && (sky[2] == 25 || sky[2] == 26);
+		bool floorOk = floor[0] == floor[1] && floor[1] == floor[2] && (floor[0] == 204 || floor[0] == 38);
+		if (!skyOk || !floorOk) { printf("FAIL stage=selftest-scene pixel mismatch\n"); return 1; }
 	}
 	r.ctx->Flush();
 	printf("PASS selftest eyes+scene rendered\n");
@@ -506,18 +518,19 @@ int main(int argc, char **argv) {
 			else renderEyes(r, e, frame);
 			lastErr[e] = comp->Submit((vr::EVREye)e, &tex[e], &bounds, vr::Submit_Default);
 			if (lastErr[e] != vr::VRCompositorError_None) {
-				printf("FAIL stage=submit eye=%c err=%s\n", e ? 'R' : 'L', compositorErrorName(lastErr[e]));
+				printf("FAIL stage=submit eye=%c err=%s frame=%u\n", e ? 'R' : 'L', compositorErrorName(lastErr[e]), frame);
 				vr::VR_Shutdown();
 				return 1;
 			}
 		}
-		frame++;
+		// Logged frame= is the number encoded in this frame's bar pattern.
 		if (GetTickCount64() >= nextLog) {
 			nextLog += 1000;
 			printf("frame=%u fmt=DXGI_FORMAT_R8G8B8A8_UNORM size=%ux%u texL=%p texR=%p submitL=%s submitR=%s\n",
 			    frame, w, h, (void *)r.eyeTex[0], (void *)r.eyeTex[1], compositorErrorName(lastErr[0]), compositorErrorName(lastErr[1]));
 			if (haveInput) actions.log(hands);
 		}
+		frame++;
 	}
 	printf("PASS frames=%u\n", frame);
 	vr::VR_Shutdown();
